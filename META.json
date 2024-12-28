@@ -1,16 +1,16 @@
 {
-   "name": "redis_fdw",
-   "abstract": "Redis FDW for PostgreSQL 9.1+",
-   "description": "This extension implements a Foreign Data Wrapper for Redis. It is supported on PostgreSQL 9.1 and above.",
+   "name": "valkey_fdw",
+   "abstract": "Valkey FDW for PostgreSQL 17.0+",
+   "description": "This extension implements a Foreign Data Wrapper for Valkey. It is supported on PostgreSQL 17.0 and above.",
    "version": "1.0.0",
    "maintainer": [
-      "Dave Page <dpage@pgadmin.org>"
+      "Dan Molik <dan@hyperspike.io>"
    ],
    "license": "postgresql",
    "provides": {
-      "redis_fdw": {
-         "abstract": "Redis FDW for PostgreSQL 9.1+",
-         "file": "redis_fdw--1.0.sql",
+      "valkey_fdw": {
+         "abstract": "Valkey FDW for PostgreSQL 17.0+",
+         "file": "valkey_fdw--1.0.sql",
          "docfile": "README",
          "version": "1.0.0"
       }
@@ -18,28 +18,28 @@
    "prereqs": {
       "runtime": {
          "requires": {
-            "PostgreSQL": "9.1.0"
+            "PostgreSQL": "17.0"
          }
       }
    },
    "resources": {
       "bugtracker": {
-         "web": "https://github.com/dpage/redis_fdw/issues"
+         "web": "https://github.com/hyperspike/valkey_fdw/issues"
       },
       "repository": {
-        "url":  "git://github.com/dpage/redis_fdw.git",
-        "web":  "http://github.com/dpage/redis_fdw/",
+        "url":  "git://github.com/hyperspike/valkey_fdw.git",
+        "web":  "http://github.com/hyperspike/valkey_fdw/",
         "type": "git"
       }
    },
-   "generated_by": "Dave Page",
+   "generated_by": "Dan Molik",
    "meta-spec": {
       "version": "1.0.0",
       "url": "http://pgxn.org/meta/spec.txt"
    },
    "tags": [
       "fdw",
-      "redis",
+      "valkey",
       "foreign data wrapper"
    ]
 }

@@ -1,7 +1,7 @@
 
 /*-------------------------------------------------------------------------
  *
- *		  foreign-data wrapper for Redis
+ *		  foreign-data wrapper for Valkey
  *
  * Copyright (c) 2011,2013 PostgreSQL Global Development Group
  *
@@ -9,9 +9,10 @@
  *
  * Authors: Dave Page <dpage@pgadmin.org>
  *			Andrew Dunstan <andrew@dunslane.net>
+ *			Dan Molik <dan@hyperspike.io>
  *
  * IDENTIFICATION
- *		  redis_fdw/redis_fdw.c
+ *		  valkey_fdw/valkey_fdw.c
  *
  *-------------------------------------------------------------------------
  */

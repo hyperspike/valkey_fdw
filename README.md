@@ -1,12 +1,13 @@
-Redis FDW for PostgreSQL 9.1+
-==============================
+Valkey FDW for PostgreSQL
+========================
 
 This PostgreSQL extension implements a Foreign Data Wrapper (FDW) for
-the Redis key/value database: http://redis.io/
+the Valkey key/value database: http://valkey.io/
 
 This code was originally experimental, and largely intended as a pet project
-for Dave to experiment with and learn about FDWs in PostgreSQL. It has now been
-extended for production use by Andrew.
+for Dave Page to experiment with and learn about FDWs in PostgreSQL. It has now been
+extended for production use by Andrew Dunstan and refactored to against Valkey by
+Dan Molik.
 
 By all means use it, but do so entirely at your own risk! You have been
 warned!
@@ -14,19 +15,17 @@ warned!
 Building
 --------
 
-To build the code, you need the hiredis C interface to Redis installed
-on your system. You can checkout the hiredis from
-https://github.com/redis/hiredis
+To build the code, you need the hiredis C interface to Valkey installed
+on your system. You can checkout the libvalkey from
+https://github.com/valkey-io/libvalkey
 or it might be available for your OS as it is for Fedora, for example.
 
 Once that's done, the extension can be built with:
 
-    PATH=/usr/local/pgsql91/bin/:$PATH make USE_PGXS=1
-    sudo PATH=/usr/local/pgsql91/bin/:$PATH make USE_PGXS=1 install
+    PATH=/usr/local/pgsql17/bin/:$PATH make USE_PGXS=1
+    sudo PATH=/usr/local/pgsql17/bin/:$PATH make USE_PGXS=1 install
 
-(assuming you have PostgreSQL 9.1 in /usr/local/pgsql91).
-
-Make necessary changes for 9.2 and later.
+(assuming you have PostgreSQL 17.0 in /usr/local/pgsql17).
 
 You will need to have the right branch checked out to match the PostgreSQL
 release you are building against, as the FDW API has changed from release
@@ -39,25 +38,25 @@ Neither of us have tested on Windows, but the code should be good on MinGW.
 Limitations
 -----------
 
-- There's no such thing as a cursor in Redis in the SQL sense,
+- There's no such thing as a cursor in Valkey in the SQL sense,
   nor MVCC, which leaves us
   with no way to atomically query the database for the available keys
   and then fetch each value. So, we get a list of keys to begin with,
   and then fetch whatever records still exist as we build the tuples.
 
-- We can only push down a single qual to Redis, which must use the
+- We can only push down a single qual to Valkey, which must use the
   TEXTEQ operator, and must be on the 'key' column.
 
-- There is no support for non-scalar datatypes in Redis
+- There is no support for non-scalar datatypes in Valkey
   such as lists, for PostgreSQL 9.1. There is such support for later releases.
 
-- Redis has acquired cursors as of Release 2.8. This is used in all the
+- Valkey has acquired cursors as of Release 2.8. This is used in all the
   mainline branches from REL9_2_STABLE on, for operations which would otherwise
-  either scan the entire Redis database in a single sweep, or scan a single,
-  possible large, keyset in a single sweep. Redis Releases prior to 2.8 are
+  either scan the entire Valkey database in a single sweep, or scan a single,
+  possible large, keyset in a single sweep. Valkey Releases prior to 2.8 are
   maintained on the REL9_x_STABLE_pre2.8 branches.
 
-- Redis cursors have some significant limitations. The Redis docs say:
+- Valkey cursors have some significant limitations. The Valkey docs say:
 
     A given element may be returned multiple times. It is up to the
     application to handle the case of duplicated elements, for example only
@@ -70,17 +69,17 @@ Limitations
 Usage
 -----
 
-The following parameters can be set on a Redis foreign server:
+The following parameters can be set on a Valkey foreign server:
 
-address:	The address or hostname of the Redis server.
+address:	The address or hostname of the Valkey server.
 	 	Default: 127.0.0.1
 
-port:		The port number on which the Redis server is listening.
+port:		The port number on which the Valkey server is listening.
      		Default: 6379
 
-The following parameters can be set on a Redis foreign table:
+The following parameters can be set on a Valkey foreign table:
 
-database:	The numeric ID of the Redis database to query.
+database:	The numeric ID of the Valkey database to query.
 	  	Default: 0
 
 (9.2 and later) tabletype: can be 'hash', 'list', 'set' or 'zset'
@@ -108,21 +107,21 @@ in the case of lists sets and scalars, rows with key and value text columns
 for hashes, and rows with a value text columns and an optional numeric score
 column for zsets.
 
-The following parameter can be set on a user mapping for a Redis
+The following parameter can be set on a user mapping for a Valkey
 foreign server:
 
-password:	The password to authenticate to the Redis server with.
+password:	The password to authenticate to the Valkey server with.
      Default: <none>
 
 Insert, Update and Delete
 -------------------------
 
 PostgreSQL acquired support for modifying foreign tables in release 9.3, and
-now the Redis Foreign Data Wrapper supports these too, for 9.3 and later
+now the Valkey Foreign Data Wrapper supports these too, for 9.3 and later
 PostgreSQL releases. There are a few restriction on this:
 
 - only INSERT works for singleton key list tables, due to limitations
-  in the Redis API for lists.
+  in the Valkey API for lists.
 - INSERT and UPDATE only work for singleton key ZSET tables if they have the
   priority column
 - non-singleton non-scalar tables must have an array type for the second column
