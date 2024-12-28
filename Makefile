@@ -28,7 +28,7 @@ REGRESS_OPTS = --inputdir=test --outputdir=test \
 
 EXTRA_CLEAN = sql/valkey_fdw.sql expected/valkey_fdw.out
 
-SHLIB_LINK += -lhiredis
+SHLIB_LINK += -lvalkey
 
 USE_PGXS = 1
 

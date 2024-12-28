@@ -32,7 +32,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <hiredis/hiredis.h>
+#include <valkey/valkey.h>
 
 #include "funcapi.h"
 #include "access/reloptions.h"
@@ -71,17 +71,17 @@ PG_MODULE_MAGIC;
 /*
  * Describes the valid options for objects that use this wrapper.
  */
-struct RedisFdwOption
+struct ValkeyFdwOption
 {
 	const char *optname;
 	Oid			optcontext;		/* Oid of catalog in which option may appear */
 };
 
 /*
- * Valid options for redis_fdw.
+ * Valid options for valkey_fdw.
  *
  */
-static struct RedisFdwOption valid_options[] =
+static struct ValkeyFdwOption valid_options[] =
 {
 
 	/* Connection options */
@@ -102,14 +102,14 @@ static struct RedisFdwOption valid_options[] =
 
 typedef enum
 {
-	PG_REDIS_SCALAR_TABLE = 0,
-	PG_REDIS_HASH_TABLE,
-	PG_REDIS_LIST_TABLE,
-	PG_REDIS_SET_TABLE,
-	PG_REDIS_ZSET_TABLE
-} redis_table_type;
+	PG_VALKEY_SCALAR_TABLE = 0,
+	PG_VALKEY_HASH_TABLE,
+	PG_VALKEY_LIST_TABLE,
+	PG_VALKEY_SET_TABLE,
+	PG_VALKEY_ZSET_TABLE
+} valkey_table_type;
 
-typedef struct redisTableOptions
+typedef struct valkeyTableOptions
 {
 	char	   *address;
 	int			port;
@@ -118,8 +118,8 @@ typedef struct redisTableOptions
 	char	   *keyprefix;
 	char	   *keyset;
 	char	   *singleton_key;
-	redis_table_type table_type;
-} redisTableOptions;
+	valkey_table_type table_type;
+} valkeyTableOptions;
 
 
 
@@ -129,17 +129,17 @@ typedef struct
 	int			svr_port;
 	char	   *svr_password;
 	int			svr_database;
-} RedisFdwPlanState;
+} ValkeyFdwPlanState;
 
 /*
  * FDW-specific information for ForeignScanState.fdw_state.
  */
 
-typedef struct RedisFdwExecutionState
+typedef struct ValkeyFdwExecutionState
 {
 	AttInMetadata *attinmeta;
-	redisContext *context;
-	redisReply *reply;
+	valkeyContext *context;
+	valkeyReply *reply;
 	long long	row;
 	char	   *address;
 	int			port;
@@ -149,15 +149,15 @@ typedef struct RedisFdwExecutionState
 	char	   *keyset;
 	char	   *qual_value;
 	char	   *singleton_key;
-	redis_table_type table_type;
+	valkey_table_type table_type;
 	char	   *cursor_search_string;
 	char	   *cursor_id;
 	MemoryContext mctxt;
-} RedisFdwExecutionState;
+} ValkeyFdwExecutionState;
 
-typedef struct RedisFdwModifyState
+typedef struct ValkeyFdwModifyState
 {
-	redisContext *context;
+	valkeyContext *context;
 	char	   *address;
 	int			port;
 	char	   *password;
@@ -167,39 +167,39 @@ typedef struct RedisFdwModifyState
 	char	   *qual_value;
 	char	   *singleton_key;
 	Relation	rel;
-	redis_table_type table_type;
+	valkey_table_type table_type;
 	List	   *target_attrs;
 	int		   *targetDims;
 	int			p_nums;
 	int			keyAttno;
 	Oid			array_elem_type;
 	FmgrInfo   *p_flinfo;
-} RedisFdwModifyState;
+} ValkeyFdwModifyState;
 
 /* initial cursor */
 #define ZERO "0"
-/* redis default is 10 - let's fetch 1000 at a time */
+/* valkey default is 10 - let's fetch 1000 at a time */
 #define COUNT " COUNT 1000"
 
 /*
  * SQL functions
  */
-extern Datum redis_fdw_handler(PG_FUNCTION_ARGS);
-extern Datum redis_fdw_validator(PG_FUNCTION_ARGS);
+extern Datum valkey_fdw_handler(PG_FUNCTION_ARGS);
+extern Datum valkey_fdw_validator(PG_FUNCTION_ARGS);
 
-PG_FUNCTION_INFO_V1(redis_fdw_handler);
-PG_FUNCTION_INFO_V1(redis_fdw_validator);
+PG_FUNCTION_INFO_V1(valkey_fdw_handler);
+PG_FUNCTION_INFO_V1(valkey_fdw_validator);
 
 /*
  * FDW callback routines
  */
-static void redisGetForeignRelSize(PlannerInfo *root,
+static void valkeyGetForeignRelSize(PlannerInfo *root,
 					   RelOptInfo *baserel,
 					   Oid foreigntableid);
-static void redisGetForeignPaths(PlannerInfo *root,
+static void valkeyGetForeignPaths(PlannerInfo *root,
 					 RelOptInfo *baserel,
 					 Oid foreigntableid);
-static ForeignScan *redisGetForeignPlan(PlannerInfo *root,
+static ForeignScan *valkeyGetForeignPlan(PlannerInfo *root,
 					RelOptInfo *baserel,
 					Oid foreigntableid,
 					ForeignPath *best_path,
@@ -207,41 +207,41 @@ static ForeignScan *redisGetForeignPlan(PlannerInfo *root,
 					List *scan_clauses,
 					Plan *outer_plan);
 
-static void redisExplainForeignScan(ForeignScanState *node, ExplainState *es);
-static void redisBeginForeignScan(ForeignScanState *node, int eflags);
-static TupleTableSlot *redisIterateForeignScan(ForeignScanState *node);
-static inline TupleTableSlot *redisIterateForeignScanMulti(ForeignScanState *node);
-static inline TupleTableSlot *redisIterateForeignScanSingleton(ForeignScanState *node);
-static void redisReScanForeignScan(ForeignScanState *node);
-static void redisEndForeignScan(ForeignScanState *node);
+static void valkeyExplainForeignScan(ForeignScanState *node, ExplainState *es);
+static void valkeyBeginForeignScan(ForeignScanState *node, int eflags);
+static TupleTableSlot *valkeyIterateForeignScan(ForeignScanState *node);
+static inline TupleTableSlot *valkeyIterateForeignScanMulti(ForeignScanState *node);
+static inline TupleTableSlot *valkeyIterateForeignScanSingleton(ForeignScanState *node);
+static void valkeyReScanForeignScan(ForeignScanState *node);
+static void valkeyEndForeignScan(ForeignScanState *node);
 
 
-static List *redisPlanForeignModify(PlannerInfo *root,
+static List *valkeyPlanForeignModify(PlannerInfo *root,
 					   ModifyTable *plan,
 					   Index resultRelation,
 					   int subplan_index);
 
-static void redisBeginForeignModify(ModifyTableState *mtstate,
+static void valkeyBeginForeignModify(ModifyTableState *mtstate,
 						ResultRelInfo *rinfo,
 						List *fdw_private,
 						int subplan_index,
 						int eflags);
 
-static TupleTableSlot *redisExecForeignInsert(EState *estate,
+static TupleTableSlot *valkeyExecForeignInsert(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot);
-static void redisEndForeignModify(EState *estate,
+static void valkeyEndForeignModify(EState *estate,
 					  ResultRelInfo *rinfo);
-static void redisAddForeignUpdateTargets(PlannerInfo *root,
+static void valkeyAddForeignUpdateTargets(PlannerInfo *root,
 										 Index rtindex,
 										 RangeTblEntry *target_rte,
 										 Relation target_relation);
-static TupleTableSlot *redisExecForeignDelete(EState *estate,
+static TupleTableSlot *valkeyExecForeignDelete(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot);
-static TupleTableSlot *redisExecForeignUpdate(EState *estate,
+static TupleTableSlot *valkeyExecForeignUpdate(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot);
@@ -249,52 +249,52 @@ static TupleTableSlot *redisExecForeignUpdate(EState *estate,
 /*
  * Helper functions
  */
-static bool redisIsValidOption(const char *option, Oid context);
-static void redisGetOptions(Oid foreigntableid, redisTableOptions *options);
-static void redisGetQual(Node *node, TupleDesc tupdesc, char **key,
+static bool valkeyIsValidOption(const char *option, Oid context);
+static void valkeyGetOptions(Oid foreigntableid, valkeyTableOptions *options);
+static void valkeyGetQual(Node *node, TupleDesc tupdesc, char **key,
 						 char **value, bool *pushdown);
-static char *process_redis_array(redisReply *reply, redis_table_type type);
-static void check_reply(redisReply *reply, redisContext *context,
+static char *process_valkey_array(valkeyReply *reply, valkey_table_type type);
+static void check_reply(valkeyReply *reply, valkeyContext *context,
 						int error_code, char *message, char *arg);
 
 /*
- * Name we will use for the junk attribute that holds the redis key
+ * Name we will use for the junk attribute that holds the valkey key
  * for update and delete operations.
  */
-#define REDISMODKEYNAME "__redis_mod_key_name"
+#define VALKEYMODKEYNAME "__valkey_mod_key_name"
 
 /*
  * Foreign-data wrapper handler function: return a struct with pointers
  * to my callback routines.
  */
 Datum
-redis_fdw_handler(PG_FUNCTION_ARGS)
+valkey_fdw_handler(PG_FUNCTION_ARGS)
 {
 	FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
 #ifdef DEBUG
-	elog(NOTICE, "redis_fdw_handler");
+	elog(NOTICE, "valkey_fdw_handler");
 #endif
 
-	fdwroutine->GetForeignRelSize = redisGetForeignRelSize;
-	fdwroutine->GetForeignPaths = redisGetForeignPaths;
-	fdwroutine->GetForeignPlan = redisGetForeignPlan;
-	/* can't ANALYSE redis */
+	fdwroutine->GetForeignRelSize = valkeyGetForeignRelSize;
+	fdwroutine->GetForeignPaths = valkeyGetForeignPaths;
+	fdwroutine->GetForeignPlan = valkeyGetForeignPlan;
+	/* can't ANALYSE valkey */
 	fdwroutine->AnalyzeForeignTable = NULL;
-	fdwroutine->ExplainForeignScan = redisExplainForeignScan;
-	fdwroutine->BeginForeignScan = redisBeginForeignScan;
-	fdwroutine->IterateForeignScan = redisIterateForeignScan;
-	fdwroutine->ReScanForeignScan = redisReScanForeignScan;
-	fdwroutine->EndForeignScan = redisEndForeignScan;
+	fdwroutine->ExplainForeignScan = valkeyExplainForeignScan;
+	fdwroutine->BeginForeignScan = valkeyBeginForeignScan;
+	fdwroutine->IterateForeignScan = valkeyIterateForeignScan;
+	fdwroutine->ReScanForeignScan = valkeyReScanForeignScan;
+	fdwroutine->EndForeignScan = valkeyEndForeignScan;
 
-	fdwroutine->PlanForeignModify = redisPlanForeignModify;		/* I U D */
-	fdwroutine->BeginForeignModify = redisBeginForeignModify;	/* I U D */
-	fdwroutine->ExecForeignInsert = redisExecForeignInsert;		/* I */
-	fdwroutine->EndForeignModify = redisEndForeignModify;		/* I U D */
+	fdwroutine->PlanForeignModify = valkeyPlanForeignModify;		/* I U D */
+	fdwroutine->BeginForeignModify = valkeyBeginForeignModify;	/* I U D */
+	fdwroutine->ExecForeignInsert = valkeyExecForeignInsert;		/* I */
+	fdwroutine->EndForeignModify = valkeyEndForeignModify;		/* I U D */
 
-	fdwroutine->ExecForeignUpdate = redisExecForeignUpdate;		/* U */
-	fdwroutine->ExecForeignDelete = redisExecForeignDelete;		/* D */
-	fdwroutine->AddForeignUpdateTargets = redisAddForeignUpdateTargets; /* U D */
+	fdwroutine->ExecForeignUpdate = valkeyExecForeignUpdate;		/* U */
+	fdwroutine->ExecForeignDelete = valkeyExecForeignDelete;		/* D */
+	fdwroutine->AddForeignUpdateTargets = valkeyAddForeignUpdateTargets; /* U D */
 
 	PG_RETURN_POINTER(fdwroutine);
 }
@@ -306,7 +306,7 @@ redis_fdw_handler(PG_FUNCTION_ARGS)
  * Raise an ERROR if the option or its value is considered invalid.
  */
 Datum
-redis_fdw_validator(PG_FUNCTION_ARGS)
+valkey_fdw_validator(PG_FUNCTION_ARGS)
 {
 	List	   *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid			catalog = PG_GETARG_OID(1);
@@ -314,27 +314,27 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 	int			svr_port = 0;
 	char	   *svr_password = NULL;
 	int			svr_database = 0;
-	redis_table_type tabletype = PG_REDIS_SCALAR_TABLE;
+	valkey_table_type tabletype = PG_VALKEY_SCALAR_TABLE;
 	char	   *tablekeyprefix = NULL;
 	char	   *tablekeyset = NULL;
 	char	   *singletonkey = NULL;
 	ListCell   *cell;
 
 #ifdef DEBUG
-	elog(NOTICE, "redis_fdw_validator");
+	elog(NOTICE, "valkey_fdw_validator");
 #endif
 
 	/*
-	 * Check that only options supported by redis_fdw, and allowed for the
+	 * Check that only options supported by valkey_fdw, and allowed for the
 	 * current object type, are given.
 	 */
 	foreach(cell, options_list)
 	{
 		DefElem    *def = (DefElem *) lfirst(cell);
 
-		if (!redisIsValidOption(def->defname, catalog))
+		if (!valkeyIsValidOption(def->defname, catalog))
 		{
-			struct RedisFdwOption *opt;
+			struct ValkeyFdwOption *opt;
 			StringInfoData buf;
 
 			/*
@@ -483,13 +483,13 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 						 errmsg("conflicting or redundant options: tabletype "
 								"(%s)", typeval)));
 			if (strcmp(typeval, "hash") == 0)
-				tabletype = PG_REDIS_HASH_TABLE;
+				tabletype = PG_VALKEY_HASH_TABLE;
 			else if (strcmp(typeval, "list") == 0)
-				tabletype = PG_REDIS_LIST_TABLE;
+				tabletype = PG_VALKEY_LIST_TABLE;
 			else if (strcmp(typeval, "set") == 0)
-				tabletype = PG_REDIS_SET_TABLE;
+				tabletype = PG_VALKEY_SET_TABLE;
 			else if (strcmp(typeval, "zset") == 0)
-				tabletype = PG_REDIS_ZSET_TABLE;
+				tabletype = PG_VALKEY_ZSET_TABLE;
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
@@ -507,12 +507,12 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
  * context is the Oid of the catalog holding the object the option is for.
  */
 static bool
-redisIsValidOption(const char *option, Oid context)
+valkeyIsValidOption(const char *option, Oid context)
 {
-	struct RedisFdwOption *opt;
+	struct ValkeyFdwOption *opt;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisIsValidOption");
+	elog(NOTICE, "valkeyIsValidOption");
 #endif
 
 	for (opt = valid_options; opt->optname; opt++)
@@ -524,10 +524,10 @@ redisIsValidOption(const char *option, Oid context)
 }
 
 /*
- * Fetch the options for a redis_fdw foreign table.
+ * Fetch the options for a valkey_fdw foreign table.
  */
 static void
-redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
+valkeyGetOptions(Oid foreigntableid, valkeyTableOptions *table_options)
 {
 	ForeignTable *table;
 	ForeignServer *server;
@@ -536,12 +536,12 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 	ListCell   *lc;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisGetOptions");
+	elog(NOTICE, "valkeyGetOptions");
 #endif
 
 	/*
 	 * Extract options from FDW objects. We only need to worry about server
-	 * options for Redis
+	 * options for Valkey
 	 *
 	 */
 	table = GetForeignTable(foreigntableid);
@@ -584,13 +584,13 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 			char	   *typeval = defGetString(def);
 
 			if (strcmp(typeval, "hash") == 0)
-				table_options->table_type = PG_REDIS_HASH_TABLE;
+				table_options->table_type = PG_VALKEY_HASH_TABLE;
 			else if (strcmp(typeval, "list") == 0)
-				table_options->table_type = PG_REDIS_LIST_TABLE;
+				table_options->table_type = PG_VALKEY_LIST_TABLE;
 			else if (strcmp(typeval, "set") == 0)
-				table_options->table_type = PG_REDIS_SET_TABLE;
+				table_options->table_type = PG_VALKEY_SET_TABLE;
 			else if (strcmp(typeval, "zset") == 0)
-				table_options->table_type = PG_REDIS_ZSET_TABLE;
+				table_options->table_type = PG_VALKEY_ZSET_TABLE;
 			/* XXX detect error here */
 		}
 	}
@@ -608,26 +608,26 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 
 
 static void
-redisGetForeignRelSize(PlannerInfo *root,
+valkeyGetForeignRelSize(PlannerInfo *root,
 					   RelOptInfo *baserel,
 					   Oid foreigntableid)
 {
-	RedisFdwPlanState *fdw_private;
-	redisTableOptions table_options;
+	ValkeyFdwPlanState *fdw_private;
+	valkeyTableOptions table_options;
 
-	redisContext *context;
-	redisReply *reply;
+	valkeyContext *context;
+	valkeyReply *reply;
 	struct timeval timeout = {1, 500000};
 
 #ifdef DEBUG
-	elog(NOTICE, "redisGetForeignRelSize");
+	elog(NOTICE, "valkeyGetForeignRelSize");
 #endif
 
 	/*
 	 * Fetch options. Get everything so we don't need to re-fetch it later in
 	 * planning.
 	 */
-	fdw_private = (RedisFdwPlanState *) palloc(sizeof(RedisFdwPlanState));
+	fdw_private = (ValkeyFdwPlanState *) palloc(sizeof(ValkeyFdwPlanState));
 	baserel->fdw_private = (void *) fdw_private;
 
 	table_options.address = NULL;
@@ -637,35 +637,35 @@ redisGetForeignRelSize(PlannerInfo *root,
 	table_options.keyprefix = NULL;
 	table_options.keyset = NULL;
 	table_options.singleton_key = NULL;
-	table_options.table_type = PG_REDIS_SCALAR_TABLE;
+	table_options.table_type = PG_VALKEY_SCALAR_TABLE;
 
-	redisGetOptions(foreigntableid, &table_options);
+	valkeyGetOptions(foreigntableid, &table_options);
 	fdw_private->svr_address = table_options.address;
 	fdw_private->svr_password = table_options.password;
 	fdw_private->svr_port = table_options.port;
 	fdw_private->svr_database = table_options.database;
 
 	/* Connect to the database */
-	context = redisConnectWithTimeout(table_options.address, table_options.port,
+	context = valkeyConnectWithTimeout(table_options.address, table_options.port,
 									  timeout);
 
 	if (context->err)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Redis: %d", context->err)
+				 errmsg("failed to connect to Valkey: %d", context->err)
 				 ));
 
 	/* Authenticate */
 	if (table_options.password)
 	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
+		reply = valkeyCommand(context, "AUTH %s", table_options.password);
 
 		if (!reply)
 		{
-			redisFree(context);
+			valkeyFree(context);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-					 errmsg("failed to authenticate to redis: %d",
+					 errmsg("failed to authenticate to valkey: %d",
 							context->err)));
 		}
 
@@ -673,11 +673,11 @@ redisGetForeignRelSize(PlannerInfo *root,
 	}
 
 	/* Select the appropriate database */
-	reply = redisCommand(context, "SELECT %d", table_options.database);
+	reply = valkeyCommand(context, "SELECT %d", table_options.database);
 
 	if (!reply)
 	{
-		redisFree(context);
+		valkeyFree(context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				 errmsg("failed to select database %d: %d",
@@ -694,12 +694,12 @@ redisGetForeignRelSize(PlannerInfo *root,
 	 */
 	if (table_options.keyprefix)
 	{
-		/* it's a pity there isn't an NKEYS command in Redis */
+		/* it's a pity there isn't an NKEYS command in Valkey */
 		int			len = strlen(table_options.keyprefix) + 2;
 		char	   *buff = palloc(len * sizeof(char));
 
 		snprintf(buff, len, "%s*", table_options.keyprefix);
-		reply = redisCommand(context, "KEYS %s", buff);
+		reply = valkeyCommand(context, "KEYS %s", buff);
 	}
 	else
 #endif
@@ -707,20 +707,20 @@ redisGetForeignRelSize(PlannerInfo *root,
 	{
 		switch (table_options.table_type)
 		{
-			case PG_REDIS_SCALAR_TABLE:
+			case PG_VALKEY_SCALAR_TABLE:
 				baserel->rows = 1;
 				return;
-			case PG_REDIS_HASH_TABLE:
-				reply = redisCommand(context, "HLEN %s", table_options.singleton_key);
+			case PG_VALKEY_HASH_TABLE:
+				reply = valkeyCommand(context, "HLEN %s", table_options.singleton_key);
 				break;
-			case PG_REDIS_LIST_TABLE:
-				reply = redisCommand(context, "LLEN %s", table_options.singleton_key);
+			case PG_VALKEY_LIST_TABLE:
+				reply = valkeyCommand(context, "LLEN %s", table_options.singleton_key);
 				break;
-			case PG_REDIS_SET_TABLE:
-				reply = redisCommand(context, "SCARD %s", table_options.singleton_key);
+			case PG_VALKEY_SET_TABLE:
+				reply = valkeyCommand(context, "SCARD %s", table_options.singleton_key);
 				break;
-			case PG_REDIS_ZSET_TABLE:
-				reply = redisCommand(context, "ZCARD %s", table_options.singleton_key);
+			case PG_VALKEY_ZSET_TABLE:
+				reply = valkeyCommand(context, "ZCARD %s", table_options.singleton_key);
 				break;
 			default:
 				;
@@ -728,16 +728,16 @@ redisGetForeignRelSize(PlannerInfo *root,
 	}
 	else if (table_options.keyset)
 	{
-		reply = redisCommand(context, "SCARD %s", table_options.keyset);
+		reply = valkeyCommand(context, "SCARD %s", table_options.keyset);
 	}
 	else
 	{
-		reply = redisCommand(context, "DBSIZE");
+		reply = valkeyCommand(context, "DBSIZE");
 	}
 
 	if (!reply)
 	{
-		redisFree(context);
+		valkeyFree(context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				 errmsg("failed to get the database size: %d", context->err)
@@ -745,7 +745,7 @@ redisGetForeignRelSize(PlannerInfo *root,
 	}
 
 #if 0
-	if (reply->type == REDIS_REPLY_ARRAY)
+	if (reply->type == VALKEY_REPLY_ARRAY)
 		baserel->rows = reply->elements;
 	else
 #endif
@@ -755,30 +755,30 @@ redisGetForeignRelSize(PlannerInfo *root,
 		baserel->rows = reply->integer;
 
 	freeReplyObject(reply);
-	redisFree(context);
+	valkeyFree(context);
 
 
 }
 
 /*
- * redisGetForeignPaths
+ * valkeyGetForeignPaths
  *		Create possible access paths for a scan on the foreign table
  *
  *		Currently we don't support any push-down feature, so there is only one
- *		possible access path, which simply returns all records in redis.
+ *		possible access path, which simply returns all records in valkey.
  */
 static void
-redisGetForeignPaths(PlannerInfo *root,
+valkeyGetForeignPaths(PlannerInfo *root,
 					 RelOptInfo *baserel,
 					 Oid foreigntableid)
 {
-	RedisFdwPlanState *fdw_private = baserel->fdw_private;
+	ValkeyFdwPlanState *fdw_private = baserel->fdw_private;
 
 	Cost		startup_cost,
 				total_cost;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisGetForeignPaths");
+	elog(NOTICE, "valkeyGetForeignPaths");
 #endif
 
 	if (strcmp(fdw_private->svr_address, "127.0.0.1") == 0 ||
@@ -806,7 +806,7 @@ redisGetForeignPaths(PlannerInfo *root,
 }
 
 static ForeignScan *
-redisGetForeignPlan(PlannerInfo *root,
+valkeyGetForeignPlan(PlannerInfo *root,
 					RelOptInfo *baserel,
 					Oid foreigntableid,
 					ForeignPath *best_path,
@@ -817,7 +817,7 @@ redisGetForeignPlan(PlannerInfo *root,
 	Index		scan_relid = baserel->relid;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisGetForeignPlan");
+	elog(NOTICE, "valkeyGetForeignPlan");
 #endif
 
 	/*
@@ -845,14 +845,14 @@ redisGetForeignPlan(PlannerInfo *root,
  *		Produce extra output for EXPLAIN
  */
 static void
-redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
+valkeyExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
-	redisReply *reply;
+	valkeyReply *reply;
 
-	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
+	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisExplainForeignScan");
+	elog(NOTICE, "valkeyExplainForeignScan");
 #endif
 
 	if (!es->costs)
@@ -866,23 +866,23 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	if (festate->keyset)
 	{
-		reply = redisCommand(festate->context, "SCARD %s", festate->keyset);
+		reply = valkeyCommand(festate->context, "SCARD %s", festate->keyset);
 	}
 	else
 	{
-		reply = redisCommand(festate->context, "DBSIZE");
+		reply = valkeyCommand(festate->context, "DBSIZE");
 	}
 
 	if (!reply)
 	{
-		redisFree(festate->context);
+		valkeyFree(festate->context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
 			errmsg("failed to get the table size: %d", festate->context->err)
 				 ));
 	}
 
-	if (reply->type == REDIS_REPLY_ERROR)
+	if (reply->type == VALKEY_REPLY_ERROR)
 	{
 		char	   *err = pstrdup(reply->str);
 
@@ -892,7 +892,7 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 				 ));
 	}
 
-	ExplainPropertyInteger("Foreign Redis Table Size", "b",
+	ExplainPropertyInteger("Foreign Valkey Table Size", "b",
 						festate->keyprefix ? reply->integer / 20 :
 						reply->integer,
 						es);
@@ -901,19 +901,19 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 }
 
 /*
- * redisBeginForeignScan
+ * valkeyBeginForeignScan
  *		Initiate access to the database
  */
 static void
-redisBeginForeignScan(ForeignScanState *node, int eflags)
+valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 {
-	redisTableOptions table_options;
-	redisContext *context;
-	redisReply *reply;
+	valkeyTableOptions table_options;
+	valkeyContext *context;
+	valkeyReply *reply;
 	char	   *qual_key = NULL;
 	char	   *qual_value = NULL;
 	bool		pushdown = false;
-	RedisFdwExecutionState *festate;
+	ValkeyFdwExecutionState *festate;
 	struct timeval timeout = {1, 500000};
 
 #ifdef DEBUG
@@ -927,37 +927,37 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	table_options.keyprefix = NULL;
 	table_options.keyset = NULL;
 	table_options.singleton_key = NULL;
-	table_options.table_type = PG_REDIS_SCALAR_TABLE;
+	table_options.table_type = PG_VALKEY_SCALAR_TABLE;
 
 
 	/* Fetch options  */
-	redisGetOptions(RelationGetRelid(node->ss.ss_currentRelation),
+	valkeyGetOptions(RelationGetRelid(node->ss.ss_currentRelation),
 					&table_options);
 
 	/* Connect to the server */
-	context = redisConnectWithTimeout(table_options.address,
+	context = valkeyConnectWithTimeout(table_options.address,
 									  table_options.port, timeout);
 
 	if (context->err)
 	{
-		redisFree(context);
+		valkeyFree(context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Redis: %s", context->errstr)
+				 errmsg("failed to connect to Valkey: %s", context->errstr)
 				 ));
 	}
 
 	/* Authenticate */
 	if (table_options.password)
 	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
+		reply = valkeyCommand(context, "AUTH %s", table_options.password);
 
 		if (!reply)
 		{
-			redisFree(context);
+			valkeyFree(context);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-			   errmsg("failed to authenticate to redis: %s", context->errstr)
+			   errmsg("failed to authenticate to valkey: %s", context->errstr)
 					 ));
 		}
 
@@ -965,11 +965,11 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	}
 
 	/* Select the appropriate database */
-	reply = redisCommand(context, "SELECT %d", table_options.database);
+	reply = valkeyCommand(context, "SELECT %d", table_options.database);
 
 	if (!reply)
 	{
-		redisFree(context);
+		valkeyFree(context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
 				 errmsg("failed to select database %d: %s",
@@ -977,7 +977,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 				 ));
 	}
 
-	if (reply->type == REDIS_REPLY_ERROR)
+	if (reply->type == VALKEY_REPLY_ERROR)
 	{
 		char	   *err = pstrdup(reply->str);
 
@@ -997,10 +997,10 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 		foreach(lc, node->ss.ps.plan->qual)
 		{
-			/* Only the first qual can be pushed down to Redis */
+			/* Only the first qual can be pushed down to Valkey */
 			Expr  *state = lfirst(lc);
 
-			redisGetQual((Node *) state,
+			valkeyGetQual((Node *) state,
 						 node->ss.ss_currentRelation->rd_att,
 						 &qual_key, &qual_value, &pushdown);
 			if (pushdown)
@@ -1009,7 +1009,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	}
 
 	/* Stash away the state info we have already */
-	festate = (RedisFdwExecutionState *) palloc(sizeof(RedisFdwExecutionState));
+	festate = (ValkeyFdwExecutionState *) palloc(sizeof(ValkeyFdwExecutionState));
 	node->fdw_state = (void *) festate;
 	festate->context = context;
 	festate->reply = NULL;
@@ -1043,29 +1043,29 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		 * theory is that we don't expect them to be so large in normal use
 		 * that we would get any significant benefit from doing so, and in any
 		 * case scanning them in a single step is not going to tie things up
-		 * like scannoing the whole Redis database could.
+		 * like scannoing the whole Valkey database could.
 		 */
 
 		switch (table_options.table_type)
 		{
-			case PG_REDIS_SCALAR_TABLE:
-				reply = redisCommand(context, "GET %s", festate->singleton_key);
+			case PG_VALKEY_SCALAR_TABLE:
+				reply = valkeyCommand(context, "GET %s", festate->singleton_key);
 				break;
-			case PG_REDIS_HASH_TABLE:
+			case PG_VALKEY_HASH_TABLE:
 				/* the singleton case where a qual pushdown makes most sense */
 				if (qual_value && pushdown)
-					reply = redisCommand(context, "HGET %s %s", festate->singleton_key, qual_value);
+					reply = valkeyCommand(context, "HGET %s %s", festate->singleton_key, qual_value);
 				else
-					reply = redisCommand(context, "HGETALL %s", festate->singleton_key);
+					reply = valkeyCommand(context, "HGETALL %s", festate->singleton_key);
 				break;
-			case PG_REDIS_LIST_TABLE:
-				reply = redisCommand(context, "LRANGE %s 0 -1", table_options.singleton_key);
+			case PG_VALKEY_LIST_TABLE:
+				reply = valkeyCommand(context, "LRANGE %s 0 -1", table_options.singleton_key);
 				break;
-			case PG_REDIS_SET_TABLE:
-				reply = redisCommand(context, "SMEMBERS %s", table_options.singleton_key);
+			case PG_VALKEY_SET_TABLE:
+				reply = valkeyCommand(context, "SMEMBERS %s", table_options.singleton_key);
 				break;
-			case PG_REDIS_ZSET_TABLE:
-				reply = redisCommand(context, "ZRANGEBYSCORE %s -inf inf WITHSCORES", table_options.singleton_key);
+			case PG_VALKEY_ZSET_TABLE:
+				reply = valkeyCommand(context, "ZRANGEBYSCORE %s -inf inf WITHSCORES", table_options.singleton_key);
 				break;
 			default:
 				;
@@ -1081,19 +1081,19 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		 */
 		if (festate->keyset)
 		{
-			redisReply *sreply;
+			valkeyReply *sreply;
 
-			sreply = redisCommand(context, "SISMEMBER %s %s",
+			sreply = valkeyCommand(context, "SISMEMBER %s %s",
 								  festate->keyset, qual_value);
 			if (!sreply)
 			{
-				redisFree(festate->context);
+				valkeyFree(festate->context);
 				ereport(ERROR,
 						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 						 errmsg("failed to list keys: %s", context->errstr)
 						 ));
 			}
-			if (sreply->type == REDIS_REPLY_ERROR)
+			if (sreply->type == VALKEY_REPLY_ERROR)
 			{
 				char	   *err = pstrdup(sreply->str);
 
@@ -1122,7 +1122,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		 * checks, is any, so we know the item is really there.
 		 */
 
-		reply = redisCommand(context, "EXISTS %s", qual_value);
+		reply = valkeyCommand(context, "EXISTS %s", qual_value);
 		if (reply->integer == 0)
 			festate->row = -1;
 
@@ -1133,31 +1133,31 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		if (festate->keyset)
 		{
 			festate->cursor_search_string = "SSCAN %s %s" COUNT;
-			reply = redisCommand(context, festate->cursor_search_string,
+			reply = valkeyCommand(context, festate->cursor_search_string,
 								 festate->keyset, ZERO);
 		}
 		else if (festate->keyprefix)
 		{
 			festate->cursor_search_string = "SCAN %s MATCH %s*" COUNT;
-			reply = redisCommand(context, festate->cursor_search_string,
+			reply = valkeyCommand(context, festate->cursor_search_string,
 								 ZERO, festate->keyprefix);
 		}
 		else
 		{
 			festate->cursor_search_string = "SCAN %s" COUNT;
-			reply = redisCommand(context, festate->cursor_search_string, ZERO);
+			reply = valkeyCommand(context, festate->cursor_search_string, ZERO);
 		}
 	}
 
 	if (!reply)
 	{
-		redisFree(festate->context);
+		valkeyFree(festate->context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				 errmsg("failed to list keys: %s", context->errstr)
 				 ));
 	}
-	else if (reply->type == REDIS_REPLY_ERROR)
+	else if (reply->type == VALKEY_REPLY_ERROR)
 	{
 		char	   *err = pstrdup(reply->str);
 
@@ -1178,9 +1178,9 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	}
 	else if (festate->row > -1 && festate->qual_value == NULL)
 	{
-		redisReply *cursor = reply->element[0];
+		valkeyReply *cursor = reply->element[0];
 
-		if (cursor->type == REDIS_REPLY_STRING)
+		if (cursor->type == VALKEY_REPLY_STRING)
 		{
 			if (cursor->len == 1 && cursor->str[0] == '0')
 				festate->cursor_id = NULL;
@@ -1201,7 +1201,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 }
 
 /*
- * redisIterateForeignScan
+ * valkeyIterateForeignScan
  *		Read next record from the data file and store it into the
  *		ScanTupleSlot as a virtual tuple
  *
@@ -1210,31 +1210,31 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
  */
 
 static TupleTableSlot *
-redisIterateForeignScan(ForeignScanState *node)
+valkeyIterateForeignScan(ForeignScanState *node)
 {
-	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
+	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 
 	if (festate->singleton_key)
-		return redisIterateForeignScanSingleton(node);
+		return valkeyIterateForeignScanSingleton(node);
 	else
-		return redisIterateForeignScanMulti(node);
+		return valkeyIterateForeignScanMulti(node);
 }
 
 static inline TupleTableSlot *
-redisIterateForeignScanMulti(ForeignScanState *node)
+valkeyIterateForeignScanMulti(ForeignScanState *node)
 {
 	bool		found;
-	redisReply *reply = 0;
+	valkeyReply *reply = 0;
 	char	   *key;
 	char	   *data = 0;
 	char	  **values;
 	HeapTuple	tuple;
 
-	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
+	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisIterateForeignScanMulti");
+	elog(NOTICE, "valkeyIterateForeignScanMulti");
 #endif
 
 	/* Cleanup */
@@ -1250,40 +1250,40 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	while (festate->cursor_id != NULL &&
 		   festate->row >= festate->reply->elements)
 	{
-		redisReply *creply;
-		redisReply *cursor;
+		valkeyReply *creply;
+		valkeyReply *cursor;
 
 		Assert(festate->qual_value == NULL);
 
 		if (festate->keyset)
 		{
-			creply = redisCommand(festate->context,
+			creply = valkeyCommand(festate->context,
 								  festate->cursor_search_string,
 								  festate->keyset, festate->cursor_id);
 		}
 		else if (festate->keyprefix)
 		{
-			creply = redisCommand(festate->context,
+			creply = valkeyCommand(festate->context,
 								  festate->cursor_search_string,
 								  festate->cursor_id, festate->keyprefix);
 		}
 		else
 		{
-			creply = redisCommand(festate->context,
+			creply = valkeyCommand(festate->context,
 								  festate->cursor_search_string,
 								  festate->cursor_id);
 		}
 
 		if (!creply)
 		{
-			redisFree(festate->context);
+			valkeyFree(festate->context);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					 errmsg("failed to list keys: %s",
 							festate->context->errstr)
 					 ));
 		}
-		else if (creply->type == REDIS_REPLY_ERROR)
+		else if (creply->type == VALKEY_REPLY_ERROR)
 		{
 			char	   *err = pstrdup(creply->str);
 
@@ -1296,7 +1296,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 
 		cursor = creply->element[0];
 
-		if (cursor->type == REDIS_REPLY_STRING)
+		if (cursor->type == VALKEY_REPLY_STRING)
 		{
 
 			MemoryContext oldcontext;
@@ -1341,32 +1341,32 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 				festate->reply->element[festate->row]->str;
 			switch (festate->table_type)
 			{
-				case PG_REDIS_HASH_TABLE:
-					reply = redisCommand(festate->context,
+				case PG_VALKEY_HASH_TABLE:
+					reply = valkeyCommand(festate->context,
 										 "HGETALL %s", key);
 					break;
-				case PG_REDIS_LIST_TABLE:
-					reply = redisCommand(festate->context,
+				case PG_VALKEY_LIST_TABLE:
+					reply = valkeyCommand(festate->context,
 										 "LRANGE %s 0 -1", key);
 					break;
-				case PG_REDIS_SET_TABLE:
-					reply = redisCommand(festate->context,
+				case PG_VALKEY_SET_TABLE:
+					reply = valkeyCommand(festate->context,
 										 "SMEMBERS %s", key);
 					break;
-				case PG_REDIS_ZSET_TABLE:
-					reply = redisCommand(festate->context,
+				case PG_VALKEY_ZSET_TABLE:
+					reply = valkeyCommand(festate->context,
 										 "ZRANGE %s 0 -1", key);
 					break;
-				case PG_REDIS_SCALAR_TABLE:
+				case PG_VALKEY_SCALAR_TABLE:
 				default:
-					reply = redisCommand(festate->context,
+					reply = valkeyCommand(festate->context,
 										 "GET %s", key);
 			}
 
 			if (!reply)
 			{
 				freeReplyObject(festate->reply);
-				redisFree(festate->context);
+				valkeyFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 						 errmsg("failed to get the value for key \"%s\": %s",
 								key, festate->context->errstr)
@@ -1375,9 +1375,9 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 
 			festate->row++;
 
-		} while ((reply->type == REDIS_REPLY_NIL ||
-				  reply->type == REDIS_REPLY_STATUS ||
-				  reply->type == REDIS_REPLY_ERROR) &&
+		} while ((reply->type == VALKEY_REPLY_NIL ||
+				  reply->type == VALKEY_REPLY_STATUS ||
+				  reply->type == VALKEY_REPLY_ERROR) &&
 				 festate->qual_value == NULL &&
 				 festate->row < festate->reply->elements);
 
@@ -1385,24 +1385,24 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 		{
 			/*
 			 * Now, deal with the different data types we might have got from
-			 * Redis.
+			 * Valkey.
 			 */
 
 			switch (reply->type)
 			{
-				case REDIS_REPLY_INTEGER:
+				case VALKEY_REPLY_INTEGER:
 					data = (char *) palloc(sizeof(char) * 64);
 					snprintf(data, 64, "%lld", reply->integer);
 					found = true;
 					break;
 
-				case REDIS_REPLY_STRING:
+				case VALKEY_REPLY_STRING:
 					data = reply->str;
 					found = true;
 					break;
 
-				case REDIS_REPLY_ARRAY:
-					data = process_redis_array(reply, festate->table_type);
+				case VALKEY_REPLY_ARRAY:
+					data = process_valkey_array(reply, festate->table_type);
 					found = true;
 					break;
 			}
@@ -1431,7 +1431,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 }
 
 static inline TupleTableSlot *
-redisIterateForeignScanSingleton(ForeignScanState *node)
+valkeyIterateForeignScanSingleton(ForeignScanState *node)
 {
 	bool		found;
 	char	   *key = NULL;
@@ -1439,11 +1439,11 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	char	  **values;
 	HeapTuple	tuple;
 
-	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
+	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisIterateForeignScanSingleton");
+	elog(NOTICE, "valkeyIterateForeignScanSingleton");
 #endif
 
 	/* Cleanup */
@@ -1455,51 +1455,51 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	/* Get the next record, and set found */
 	found = false;
 
-	if (festate->table_type == PG_REDIS_SCALAR_TABLE)
+	if (festate->table_type == PG_VALKEY_SCALAR_TABLE)
 	{
 		festate->row = -1;		/* just one row for a scalar */
 		switch (festate->reply->type)
 		{
-			case REDIS_REPLY_INTEGER:
+			case VALKEY_REPLY_INTEGER:
 				key = (char *) palloc(sizeof(char) * 64);
 				snprintf(key, 64, "%lld", festate->reply->integer);
 				found = true;
 				break;
 
-			case REDIS_REPLY_STRING:
+			case VALKEY_REPLY_STRING:
 				key = festate->reply->str;
 				found = true;
 				break;
 
-			case REDIS_REPLY_ARRAY:
+			case VALKEY_REPLY_ARRAY:
 				freeReplyObject(festate->reply);
-				redisFree(festate->context);
+				valkeyFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 				errmsg("not expecting an array for a singleton scalar table")
 								));
 				break;
 		}
 	}
-	else if (festate->table_type == PG_REDIS_HASH_TABLE && festate->qual_value)
+	else if (festate->table_type == PG_VALKEY_HASH_TABLE && festate->qual_value)
 	{
 		festate->row = -1;		/* just one row for qual'd search in a hash */
 		key = festate->qual_value;
 		switch (festate->reply->type)
 		{
-			case REDIS_REPLY_INTEGER:
+			case VALKEY_REPLY_INTEGER:
 				data = (char *) palloc(sizeof(char) * 64);
 				snprintf(data, 64, "%lld", festate->reply->integer);
 				found = true;
 				break;
 
-			case REDIS_REPLY_STRING:
+			case VALKEY_REPLY_STRING:
 				data = festate->reply->str;
 				found = true;
 				break;
 
-			case REDIS_REPLY_ARRAY:
+			case VALKEY_REPLY_ARRAY:
 				freeReplyObject(festate->reply);
-				redisFree(festate->context);
+				valkeyFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 								errmsg("not expecting an array for a single hash property: %s", festate->qual_value)
 								));
@@ -1512,25 +1512,25 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 		found = true;
 		key = festate->reply->element[festate->row]->str;
 		festate->row++;
-		if (festate->table_type == PG_REDIS_HASH_TABLE ||
-			festate->table_type == PG_REDIS_ZSET_TABLE)
+		if (festate->table_type == PG_VALKEY_HASH_TABLE ||
+			festate->table_type == PG_VALKEY_ZSET_TABLE)
 		{
-			redisReply *dreply = festate->reply->element[festate->row];
+			valkeyReply *dreply = festate->reply->element[festate->row];
 
 			switch (dreply->type)
 			{
-				case REDIS_REPLY_INTEGER:
+				case VALKEY_REPLY_INTEGER:
 					data = (char *) palloc(sizeof(char) * 64);
 					snprintf(key, 64, "%lld", dreply->integer);
 					break;
 
-				case REDIS_REPLY_STRING:
+				case VALKEY_REPLY_STRING:
 					data = dreply->str;
 					break;
 
-				case REDIS_REPLY_ARRAY:
+				case VALKEY_REPLY_ARRAY:
 					freeReplyObject(festate->reply);
-					redisFree(festate->context);
+					valkeyFree(festate->context);
 					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 									errmsg("not expecting array for a hash value or zset score")
 									));
@@ -1555,16 +1555,16 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 }
 
 /*
- * redisEndForeignScan
+ * valkeyEndForeignScan
  *		Finish scanning foreign table and dispose objects used for this scan
  */
 static void
-redisEndForeignScan(ForeignScanState *node)
+valkeyEndForeignScan(ForeignScanState *node)
 {
-	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
+	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisEndForeignScan");
+	elog(NOTICE, "valkeyEndForeignScan");
 #endif
 
 	/* if festate is NULL, we are in EXPLAIN; nothing to do */
@@ -1574,21 +1574,21 @@ redisEndForeignScan(ForeignScanState *node)
 			freeReplyObject(festate->reply);
 
 		if (festate->context)
-			redisFree(festate->context);
+			valkeyFree(festate->context);
 	}
 }
 
 /*
- * redisReScanForeignScan
+ * valkeyReScanForeignScan
  *		Rescan table, possibly with new parameters
  */
 static void
-redisReScanForeignScan(ForeignScanState *node)
+valkeyReScanForeignScan(ForeignScanState *node)
 {
-	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
+	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisReScanForeignScan");
+	elog(NOTICE, "valkeyReScanForeignScan");
 #endif
 
 	if (festate->row > -1)
@@ -1596,7 +1596,7 @@ redisReScanForeignScan(ForeignScanState *node)
 }
 
 static void
-redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *pushdown)
+valkeyGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *pushdown)
 {
 	*key = NULL;
 	*value = NULL;
@@ -1650,7 +1650,7 @@ redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
 
 
 static char *
-process_redis_array(redisReply *reply, redis_table_type type)
+process_valkey_array(valkeyReply *reply, valkey_table_type type)
 {
 	StringInfo	res = makeStringInfo();
 	bool		need_sep = false;
@@ -1658,19 +1658,19 @@ process_redis_array(redisReply *reply, redis_table_type type)
 	appendStringInfoChar(res, '{');
 	for (int i = 0; i < reply->elements; i++)
 	{
-		redisReply *ir = reply->element[i];
+		valkeyReply *ir = reply->element[i];
 
 		if (need_sep)
 			appendStringInfoChar(res, ',');
 		need_sep = true;
-		if (ir->type == REDIS_REPLY_ARRAY)
+		if (ir->type == VALKEY_REPLY_ARRAY)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),	/* ??? */
 					 errmsg("nested array returns not yet supported")));
 		switch (ir->type)
 		{
-			case REDIS_REPLY_STATUS:
-			case REDIS_REPLY_STRING:
+			case VALKEY_REPLY_STATUS:
+			case VALKEY_REPLY_STRING:
 				{
 					char	   *buff;
 					char	   *crs;
@@ -1691,10 +1691,10 @@ process_redis_array(redisReply *reply, redis_table_type type)
 					pfree(buff);
 				}
 				break;
-			case REDIS_REPLY_INTEGER:
+			case VALKEY_REPLY_INTEGER:
 				appendStringInfo(res, "%lld", ir->integer);
 				break;
-			case REDIS_REPLY_NIL:
+			case VALKEY_REPLY_NIL:
 				appendStringInfoString(res, "NULL");
 				break;
 			default:
@@ -1709,7 +1709,7 @@ process_redis_array(redisReply *reply, redis_table_type type)
 
 
 static void
-redisAddForeignUpdateTargets(PlannerInfo *root,
+valkeyAddForeignUpdateTargets(PlannerInfo *root,
 							 Index rtindex,
 							 RangeTblEntry *target_rte,
 							 Relation target_relation)
@@ -1721,13 +1721,13 @@ redisAddForeignUpdateTargets(PlannerInfo *root,
 		TupleDescAttr(RelationGetDescr(target_relation), 0);
 
 #ifdef DEBUG
-	elog(NOTICE, "redisAddForeignUpdateTargets");
+	elog(NOTICE, "valkeyAddForeignUpdateTargets");
 #endif
 
 	/*
 	 * Code adapted from  postgres_fdw
 	 *
-	 * In Redis, we need the key name. It's the first column in the table
+	 * In Valkey, we need the key name. It's the first column in the table
 	 * regardless of the table type. Knowing the key, we can update or delete
 	 * it.
 	 */
@@ -1741,12 +1741,12 @@ redisAddForeignUpdateTargets(PlannerInfo *root,
 				  0);
 
 	/* register it as a row-identity column needed by this target rel */
-	add_row_identity_var(root, var, rtindex, REDISMODKEYNAME);
+	add_row_identity_var(root, var, rtindex, VALKEYMODKEYNAME);
 
 }
 
 static List *
-redisPlanForeignModify(PlannerInfo *root,
+valkeyPlanForeignModify(PlannerInfo *root,
 					   ModifyTable *plan,
 					   Index resultRelation,
 					   int subplan_index)
@@ -1760,7 +1760,7 @@ redisPlanForeignModify(PlannerInfo *root,
 	Oid			array_element_type = InvalidOid;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisPlanForeignModify");
+	elog(NOTICE, "valkeyPlanForeignModify");
 #endif
 
 	/*
@@ -1824,16 +1824,16 @@ redisPlanForeignModify(PlannerInfo *root,
 }
 
 static void
-redisBeginForeignModify(ModifyTableState *mtstate,
+valkeyBeginForeignModify(ModifyTableState *mtstate,
 						ResultRelInfo *rinfo,
 						List *fdw_private,
 						int subplan_index,
 						int eflags)
 {
-	redisTableOptions table_options;
-	redisContext *context;
-	redisReply *reply;
-	RedisFdwModifyState *fmstate;
+	valkeyTableOptions table_options;
+	valkeyContext *context;
+	valkeyReply *reply;
+	ValkeyFdwModifyState *fmstate;
 	struct timeval timeout = {1, 500000};
 	Relation	rel = rinfo->ri_RelationDesc;
 	ListCell   *lc;
@@ -1844,7 +1844,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	List	   *array_elem_list;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisBeginForeignModify");
+	elog(NOTICE, "valkeyBeginForeignModify");
 #endif
 
 	table_options.address = NULL;
@@ -1854,15 +1854,15 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	table_options.keyprefix = NULL;
 	table_options.keyset = NULL;
 	table_options.singleton_key = NULL;
-	table_options.table_type = PG_REDIS_SCALAR_TABLE;
+	table_options.table_type = PG_VALKEY_SCALAR_TABLE;
 
 
 	/* Fetch options  */
-	redisGetOptions(RelationGetRelid(rel),
+	valkeyGetOptions(RelationGetRelid(rel),
 					&table_options);
 
 
-	fmstate = (RedisFdwModifyState *) palloc(sizeof(RedisFdwModifyState));
+	fmstate = (ValkeyFdwModifyState *) palloc(sizeof(ValkeyFdwModifyState));
 	rinfo->ri_FdwState = fmstate;
 	fmstate->rel = rel;
 	fmstate->address = table_options.address;
@@ -1888,7 +1888,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 		Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(rel), 0);		/* key is first */
 
 		fmstate->keyAttno = ExecFindJunkAttributeInTlist(subplan->targetlist,
-														 REDISMODKEYNAME);
+														 VALKEYMODKEYNAME);
 
 		getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
 		fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
@@ -1915,7 +1915,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 			 */
 			if (op == CMD_UPDATE && attnum > 1 &&
 				attr->attndims == 0 && !fmstate->singleton_key &&
-				fmstate->table_type != PG_REDIS_SCALAR_TABLE)
+				fmstate->table_type != PG_VALKEY_SCALAR_TABLE)
 			{
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1945,13 +1945,13 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	{
 		if (table_options.singleton_key)
 		{
-			if (table_options.table_type == PG_REDIS_ZSET_TABLE && fmstate->p_nums < 2)
+			if (table_options.table_type == PG_VALKEY_ZSET_TABLE && fmstate->p_nums < 2)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("operation not supported for singleton zset "
 								"table without priorities column")
 						 ));
-			else if (fmstate->p_nums != ((table_options.table_type == PG_REDIS_HASH_TABLE || table_options.table_type == PG_REDIS_ZSET_TABLE) ? 2 : 1))
+			else if (fmstate->p_nums != ((table_options.table_type == PG_VALKEY_HASH_TABLE || table_options.table_type == PG_VALKEY_ZSET_TABLE) ? 2 : 1))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("table has incorrect number of columns: %d for type %d", fmstate->p_nums, table_options.table_type)
@@ -1967,7 +1967,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	}
 	else if (op == CMD_UPDATE)
 	{
-		if (table_options.singleton_key && fmstate->table_type == PG_REDIS_LIST_TABLE)
+		if (table_options.singleton_key && fmstate->table_type == PG_VALKEY_LIST_TABLE)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("update not supported for this type of table")
@@ -1975,7 +1975,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	}
 	else	/* DELETE */
 	{
-		if (table_options.singleton_key && fmstate->table_type == PG_REDIS_LIST_TABLE)
+		if (table_options.singleton_key && fmstate->table_type == PG_VALKEY_LIST_TABLE)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("delete not supported for this type of table")
@@ -1991,30 +1991,30 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
-	/* Finally, Connect to the server and set the Redis execution context */
-	context = redisConnectWithTimeout(table_options.address,
+	/* Finally, Connect to the server and set the Valkey execution context */
+	context = valkeyConnectWithTimeout(table_options.address,
 									  table_options.port, timeout);
 
 	if (context->err)
 	{
-		redisFree(context);
+		valkeyFree(context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Redis: %s", context->errstr)
+				 errmsg("failed to connect to Valkey: %s", context->errstr)
 				 ));
 	}
 
 	/* Authenticate */
 	if (table_options.password)
 	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
+		reply = valkeyCommand(context, "AUTH %s", table_options.password);
 
 		if (!reply)
 		{
-			redisFree(context);
+			valkeyFree(context);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-			   errmsg("failed to authenticate to redis: %s", context->errstr)
+			   errmsg("failed to authenticate to valkey: %s", context->errstr)
 					 ));
 		}
 
@@ -2022,7 +2022,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	}
 
 	/* Select the appropriate database */
-	reply = redisCommand(context, "SELECT %d", table_options.database);
+	reply = valkeyCommand(context, "SELECT %d", table_options.database);
 
 	check_reply(reply, context, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
 				"failed to select database", NULL);
@@ -2034,7 +2034,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 }
 
 static void
-check_reply(redisReply *reply, redisContext *context, int error_code, char *message, char *arg)
+check_reply(valkeyReply *reply, valkeyContext *context, int error_code, char *message, char *arg)
 {
 	char	   *err;
 	char	   *xmessage;
@@ -2043,9 +2043,9 @@ check_reply(redisReply *reply, redisContext *context, int error_code, char *mess
 	if (!reply)
 	{
 		err = pstrdup(context->errstr);
-		redisFree(context);
+		valkeyFree(context);
 	}
-	else if (reply->type == REDIS_REPLY_ERROR)
+	else if (reply->type == VALKEY_REPLY_ERROR)
 	{
 		err = pstrdup(reply->str);
 		freeReplyObject(reply);
@@ -2071,22 +2071,22 @@ check_reply(redisReply *reply, redisContext *context, int error_code, char *mess
 }
 
 static TupleTableSlot *
-redisExecForeignInsert(EState *estate,
+valkeyExecForeignInsert(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot)
 {
-	RedisFdwModifyState *fmstate =
-	(RedisFdwModifyState *) rinfo->ri_FdwState;
-	redisContext *context = fmstate->context;
-	redisReply *sreply = NULL;
+	ValkeyFdwModifyState *fmstate =
+	(ValkeyFdwModifyState *) rinfo->ri_FdwState;
+	valkeyContext *context = fmstate->context;
+	valkeyReply *sreply = NULL;
 	bool		isnull;
 	Datum		key;
 	char	   *keyval;
 	char	   *extraval = "";	/* hash value or zset priority */
 
 #ifdef DEBUG
-	elog(NOTICE, "redisExecForeignInsert");
+	elog(NOTICE, "valkeyExecForeignInsert");
 #endif
 
 	key = slot_getattr(slot, 1, &isnull);
@@ -2097,7 +2097,7 @@ redisExecForeignInsert(EState *estate,
 
 		char	   *rkeyval;
 
-		if (fmstate->table_type == PG_REDIS_SCALAR_TABLE)
+		if (fmstate->table_type == PG_VALKEY_SCALAR_TABLE)
 			rkeyval = fmstate->singleton_key;
 		else
 			rkeyval = keyval;
@@ -2111,29 +2111,29 @@ redisExecForeignInsert(EState *estate,
 
 		switch (fmstate->table_type)
 		{
-			case PG_REDIS_SCALAR_TABLE:
-				sreply = redisCommand(context, "EXISTS %s",		/* 1 or 0 */
+			case PG_VALKEY_SCALAR_TABLE:
+				sreply = valkeyCommand(context, "EXISTS %s",		/* 1 or 0 */
 									  fmstate->singleton_key);
 				break;
-			case PG_REDIS_HASH_TABLE:
-				sreply = redisCommand(context, "HEXISTS %s %s", /* 1 or 0 */
+			case PG_VALKEY_HASH_TABLE:
+				sreply = valkeyCommand(context, "HEXISTS %s %s", /* 1 or 0 */
 									  fmstate->singleton_key, keyval);
 				break;
-			case PG_REDIS_SET_TABLE:
-				sreply = redisCommand(context, "SISMEMBER %s %s",		/* 1 or 0 */
+			case PG_VALKEY_SET_TABLE:
+				sreply = valkeyCommand(context, "SISMEMBER %s %s",		/* 1 or 0 */
 									  fmstate->singleton_key, keyval);
 				break;
-			case PG_REDIS_ZSET_TABLE:
-				sreply = redisCommand(context, "ZRANK %s %s",	/* n or nil */
+			case PG_VALKEY_ZSET_TABLE:
+				sreply = valkeyCommand(context, "ZRANK %s %s",	/* n or nil */
 
 									  fmstate->singleton_key, keyval);
 				break;
-			case PG_REDIS_LIST_TABLE:
+			case PG_VALKEY_LIST_TABLE:
 			default:
 				break;
 		}
 
-		if (fmstate->table_type != PG_REDIS_LIST_TABLE)
+		if (fmstate->table_type != PG_VALKEY_LIST_TABLE)
 		{
 
 			bool		ok = true;
@@ -2141,11 +2141,11 @@ redisExecForeignInsert(EState *estate,
 			check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed checking key existence", NULL);
 
-			if (fmstate->table_type != PG_REDIS_ZSET_TABLE)
-				ok = sreply->type == REDIS_REPLY_INTEGER &&
+			if (fmstate->table_type != PG_VALKEY_ZSET_TABLE)
+				ok = sreply->type == VALKEY_REPLY_INTEGER &&
 					sreply->integer == 0;
 			else
-				ok = sreply->type == REDIS_REPLY_NIL;
+				ok = sreply->type == VALKEY_REPLY_NIL;
 
 			freeReplyObject(sreply);
 
@@ -2161,8 +2161,8 @@ redisExecForeignInsert(EState *estate,
 
 		/* get the second value for appropriate table types */
 
-		if (fmstate->table_type == PG_REDIS_ZSET_TABLE ||
-			fmstate->table_type == PG_REDIS_HASH_TABLE)
+		if (fmstate->table_type == PG_VALKEY_ZSET_TABLE ||
+			fmstate->table_type == PG_VALKEY_HASH_TABLE)
 		{
 			Datum		extra;
 
@@ -2172,29 +2172,29 @@ redisExecForeignInsert(EState *estate,
 
 		switch (fmstate->table_type)
 		{
-			case PG_REDIS_SCALAR_TABLE:
-				sreply = redisCommand(context, "SET %s %s",
+			case PG_VALKEY_SCALAR_TABLE:
+				sreply = valkeyCommand(context, "SET %s %s",
 									  fmstate->singleton_key, keyval);
 				break;
-			case PG_REDIS_SET_TABLE:
-				sreply = redisCommand(context, "SADD %s %s",
+			case PG_VALKEY_SET_TABLE:
+				sreply = valkeyCommand(context, "SADD %s %s",
 									  fmstate->singleton_key, keyval);
 				break;
-			case PG_REDIS_LIST_TABLE:
-				sreply = redisCommand(context, "RPUSH %s %s",
+			case PG_VALKEY_LIST_TABLE:
+				sreply = valkeyCommand(context, "RPUSH %s %s",
 									  fmstate->singleton_key, keyval);
 				break;
-			case PG_REDIS_HASH_TABLE:
-				sreply = redisCommand(context, "HSET %s %s %s",
+			case PG_VALKEY_HASH_TABLE:
+				sreply = valkeyCommand(context, "HSET %s %s %s",
 								   fmstate->singleton_key, keyval, extraval);
 				break;
-			case PG_REDIS_ZSET_TABLE:
+			case PG_VALKEY_ZSET_TABLE:
 
 				/*
 				 * score comes BEFORE value in ZADD, which seems slightly
 				 * perverse
 				 */
-				sreply = redisCommand(context, "ZADD %s %s %s",
+				sreply = valkeyCommand(context, "ZADD %s %s %s",
 								   fmstate->singleton_key, extraval, keyval);
 				break;
 			default:
@@ -2231,18 +2231,18 @@ redisExecForeignInsert(EState *estate,
 		if (isnull)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot insert NULL into a Redis table")
+					 errmsg("cannot insert NULL into a Valkey table")
 					 ));
 
-		if (is_array && fmstate->table_type == PG_REDIS_SCALAR_TABLE)
+		if (is_array && fmstate->table_type == PG_VALKEY_SCALAR_TABLE)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot insert array into into a Redis scalar table")
+				 errmsg("cannot insert array into into a Valkey scalar table")
 					 ));
-		else if (!is_array && fmstate->table_type != PG_REDIS_SCALAR_TABLE)
+		else if (!is_array && fmstate->table_type != PG_VALKEY_SCALAR_TABLE)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot insert into this type of Redis table - needs an array")
+					 errmsg("cannot insert into this type of Valkey table - needs an array")
 					 ));
 
 		/* make sure the key has the right prefix, if any */
@@ -2256,12 +2256,12 @@ redisExecForeignInsert(EState *estate,
 					 ));
 
 		/* Check if key is there using EXISTS  */
-		sreply = redisCommand(context, "EXISTS %s",		/* 1 or 0 */
+		sreply = valkeyCommand(context, "EXISTS %s",		/* 1 or 0 */
 							  keyval);
 		check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"failed checking key existence", NULL);
 
-		if (sreply->type != REDIS_REPLY_INTEGER || sreply->integer != 0)
+		if (sreply->type != VALKEY_REPLY_INTEGER || sreply->integer != 0)
 		{
 			freeReplyObject(sreply);
 			ereport(ERROR,
@@ -2273,7 +2273,7 @@ redisExecForeignInsert(EState *estate,
 
 		/* if OK add values using SET / HSET / SADD / ZADD / RPUSH */
 
-		if (fmstate->table_type == PG_REDIS_SCALAR_TABLE)
+		if (fmstate->table_type == PG_VALKEY_SCALAR_TABLE)
 		{
 			/* everything else will be an array */
 			valueval = OutputFunctionCall(&fmstate->p_flinfo[1], value);
@@ -2293,13 +2293,13 @@ redisExecForeignInsert(EState *estate,
 			if (nitems == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot store empty list in a Redis table")
+						 errmsg("cannot store empty list in a Valkey table")
 						 ));
 
-			if (fmstate->table_type == PG_REDIS_HASH_TABLE && nitems % 2 != 0)
+			if (fmstate->table_type == PG_VALKEY_HASH_TABLE && nitems % 2 != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot decompose odd number of items into a Redis hash")
+						 errmsg("cannot decompose odd number of items into a Valkey hash")
 						 ));
 
 			for (i = 0; i < nitems; i++)
@@ -2307,22 +2307,22 @@ redisExecForeignInsert(EState *estate,
 				if (nulls[i])
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cannot insert NULL into a Redis table")
+							 errmsg("cannot insert NULL into a Valkey table")
 							 ));
 			}
 		}
 
 		switch (fmstate->table_type)
 		{
-			case PG_REDIS_SCALAR_TABLE:
-				sreply = redisCommand(context, "SET %s %s",
+			case PG_VALKEY_SCALAR_TABLE:
+				sreply = valkeyCommand(context, "SET %s %s",
 									  keyval, valueval);
 				check_reply(sreply, context,
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"could not add key %s", keyval);
 				freeReplyObject(sreply);
 				break;
-			case PG_REDIS_SET_TABLE:
+			case PG_VALKEY_SET_TABLE:
 				{
 					int			i;
 
@@ -2330,7 +2330,7 @@ redisExecForeignInsert(EState *estate,
 					{
 						valueval = OutputFunctionCall(&fmstate->p_flinfo[1],
 													  elements[i]);
-						sreply = redisCommand(context, "SADD %s %s",
+						sreply = valkeyCommand(context, "SADD %s %s",
 											  keyval, valueval);
 						check_reply(sreply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2339,7 +2339,7 @@ redisExecForeignInsert(EState *estate,
 					}
 				}
 				break;
-			case PG_REDIS_LIST_TABLE:
+			case PG_VALKEY_LIST_TABLE:
 				{
 					int			i;
 
@@ -2347,7 +2347,7 @@ redisExecForeignInsert(EState *estate,
 					{
 						valueval = OutputFunctionCall(&fmstate->p_flinfo[1],
 													  elements[i]);
-						sreply = redisCommand(context, "RPUSH %s %s",
+						sreply = valkeyCommand(context, "RPUSH %s %s",
 											  keyval, valueval);
 						check_reply(sreply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2355,7 +2355,7 @@ redisExecForeignInsert(EState *estate,
 					}
 				}
 				break;
-			case PG_REDIS_HASH_TABLE:
+			case PG_VALKEY_HASH_TABLE:
 				{
 					int			i;
 					char	   *hk,
@@ -2367,7 +2367,7 @@ redisExecForeignInsert(EState *estate,
 												elements[i]);
 						hv = OutputFunctionCall(&fmstate->p_flinfo[1],
 												elements[i + 1]);
-						sreply = redisCommand(context, "HSET %s %s %s",
+						sreply = valkeyCommand(context, "HSET %s %s %s",
 											  keyval, hk, hv);
 						check_reply(sreply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2376,7 +2376,7 @@ redisExecForeignInsert(EState *estate,
 					}
 				}
 				break;
-			case PG_REDIS_ZSET_TABLE:
+			case PG_VALKEY_ZSET_TABLE:
 				{
 					int			i;
 					char		ibuff[100];
@@ -2391,7 +2391,7 @@ redisExecForeignInsert(EState *estate,
 						 * score comes BEFORE value in ZADD, which seems
 						 * slightly perverse
 						 */
-						sreply = redisCommand(context, "ZADD %s %s %s",
+						sreply = valkeyCommand(context, "ZADD %s %s %s",
 											  keyval, ibuff, valueval);
 						check_reply(sreply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2411,7 +2411,7 @@ redisExecForeignInsert(EState *estate,
 
 		if (fmstate->keyset)
 		{
-			sreply = redisCommand(context, "SADD %s %s",
+			sreply = valkeyCommand(context, "SADD %s %s",
 								  fmstate->keyset, keyval);
 			check_reply(sreply, context,
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2423,21 +2423,21 @@ redisExecForeignInsert(EState *estate,
 }
 
 static TupleTableSlot *
-redisExecForeignDelete(EState *estate,
+valkeyExecForeignDelete(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot)
 {
-	RedisFdwModifyState *fmstate =
-	(RedisFdwModifyState *) rinfo->ri_FdwState;
-	redisContext *context = fmstate->context;
-	redisReply *reply = NULL;
+	ValkeyFdwModifyState *fmstate =
+	(ValkeyFdwModifyState *) rinfo->ri_FdwState;
+	valkeyContext *context = fmstate->context;
+	valkeyReply *reply = NULL;
 	bool		isNull;
 	Datum		datum;
 	char	   *keyval;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisExecForeignDelete");
+	elog(NOTICE, "valkeyExecForeignDelete");
 #endif
 
 	/* Get the key that was passed up as a resjunk column */
@@ -2453,20 +2453,20 @@ redisExecForeignDelete(EState *estate,
 	{
 		switch (fmstate->table_type)
 		{
-			case PG_REDIS_SCALAR_TABLE:
-				reply = redisCommand(context, "DEL %s",
+			case PG_VALKEY_SCALAR_TABLE:
+				reply = valkeyCommand(context, "DEL %s",
 									 fmstate->singleton_key);
 				break;
-			case PG_REDIS_SET_TABLE:
-				reply = redisCommand(context, "SREM %s %s",
+			case PG_VALKEY_SET_TABLE:
+				reply = valkeyCommand(context, "SREM %s %s",
 									 fmstate->singleton_key, keyval);
 				break;
-			case PG_REDIS_HASH_TABLE:
-				reply = redisCommand(context, "HDEL %s %s",
+			case PG_VALKEY_HASH_TABLE:
+				reply = valkeyCommand(context, "HDEL %s %s",
 									 fmstate->singleton_key, keyval);
 				break;
-			case PG_REDIS_ZSET_TABLE:
-				reply = redisCommand(context, "ZREM %s %s",
+			case PG_VALKEY_ZSET_TABLE:
+				reply = valkeyCommand(context, "ZREM %s %s",
 									 fmstate->singleton_key, keyval);
 				break;
 			default:
@@ -2480,7 +2480,7 @@ redisExecForeignDelete(EState *estate,
 	else	/* not a singleton */
 	{
 		/* use DEL regardless of table type */
-		reply = redisCommand(context, "DEL %s", keyval);
+		reply = valkeyCommand(context, "DEL %s", keyval);
 	}
 
 	check_reply(reply, context,
@@ -2490,7 +2490,7 @@ redisExecForeignDelete(EState *estate,
 
 	if (fmstate->keyset)
 	{
-		reply = redisCommand(context, "SREM %s %s",
+		reply = valkeyCommand(context, "SREM %s %s",
 							 fmstate->keyset, keyval);
 
 		check_reply(reply, context,
@@ -2504,15 +2504,15 @@ redisExecForeignDelete(EState *estate,
 }
 
 static TupleTableSlot *
-redisExecForeignUpdate(EState *estate,
+valkeyExecForeignUpdate(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot)
 {
-	RedisFdwModifyState *fmstate =
-	(RedisFdwModifyState *) rinfo->ri_FdwState;
-	redisContext *context = fmstate->context;
-	redisReply *ereply = NULL;
+	ValkeyFdwModifyState *fmstate =
+	(ValkeyFdwModifyState *) rinfo->ri_FdwState;
+	valkeyContext *context = fmstate->context;
+	valkeyReply *ereply = NULL;
 	Datum		datum;
 	char	   *keyval;
 	char	   *newkey;
@@ -2524,7 +2524,7 @@ redisExecForeignUpdate(EState *estate,
 	int			nitems = 0;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisExecForeignUpdate");
+	elog(NOTICE, "valkeyExecForeignUpdate");
 #endif
 
 	/* Get the key that was passed up as a resjunk column */
@@ -2553,7 +2553,7 @@ redisExecForeignUpdate(EState *estate,
 			newkey = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
 		}
 		else if (fmstate->singleton_key ||
-				 fmstate->table_type == PG_REDIS_SCALAR_TABLE)
+				 fmstate->table_type == PG_VALKEY_SCALAR_TABLE)
 		{
 			/*
 			 * non-singleton scalar value, or singleton hash value, or
@@ -2585,13 +2585,13 @@ redisExecForeignUpdate(EState *estate,
 			if (nitems == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot store empty list in a Redis table")
+						 errmsg("cannot store empty list in a Valkey table")
 						 ));
 
-			if (fmstate->table_type == PG_REDIS_HASH_TABLE && nitems % 2 != 0)
+			if (fmstate->table_type == PG_VALKEY_HASH_TABLE && nitems % 2 != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot decompose odd number of items into a Redis hash")
+						 errmsg("cannot decompose odd number of items into a Valkey hash")
 						 ));
 
 			array_vals = palloc(nitems * sizeof(char *));
@@ -2601,7 +2601,7 @@ redisExecForeignUpdate(EState *estate,
 				if (nulls[i])
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cannot set NULL in a Redis table")
+							 errmsg("cannot set NULL in a Valkey table")
 							 ));
 
 				array_vals[i] = OutputFunctionCall(&fmstate->p_flinfo[flslot],
@@ -2625,8 +2625,8 @@ redisExecForeignUpdate(EState *estate,
 		/* make sure the new key doesn't exist */
 		if (!fmstate->singleton_key)
 		{
-			ereply = redisCommand(context, "EXISTS %s", newkey);
-			ok = ereply->type == REDIS_REPLY_INTEGER && ereply->integer == 0;
+			ereply = valkeyCommand(context, "EXISTS %s", newkey);
+			ok = ereply->type == VALKEY_REPLY_INTEGER && ereply->integer == 0;
 			check_reply(ereply, context,
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed checking key existence %s", newkey);
@@ -2635,28 +2635,28 @@ redisExecForeignUpdate(EState *estate,
 		{
 			switch (fmstate->table_type)
 			{
-				case PG_REDIS_SET_TABLE:
-					ereply = redisCommand(context, "SISMEMBER %s %s",
+				case PG_VALKEY_SET_TABLE:
+					ereply = valkeyCommand(context, "SISMEMBER %s %s",
 										  fmstate->singleton_key, newkey);
 					break;
-				case PG_REDIS_ZSET_TABLE:
-					ereply = redisCommand(context, "ZRANK %s %s",
+				case PG_VALKEY_ZSET_TABLE:
+					ereply = valkeyCommand(context, "ZRANK %s %s",
 										  fmstate->singleton_key, newkey);
 					break;
-				case PG_REDIS_HASH_TABLE:
-					ereply = redisCommand(context, "HEXISTS %s %s",
+				case PG_VALKEY_HASH_TABLE:
+					ereply = valkeyCommand(context, "HEXISTS %s %s",
 										  fmstate->singleton_key, newkey);
 					break;
 				default:
 					break;
 			}
-			if (fmstate->table_type != PG_REDIS_SCALAR_TABLE)
+			if (fmstate->table_type != PG_VALKEY_SCALAR_TABLE)
 			{
-				if (fmstate->table_type != PG_REDIS_ZSET_TABLE)
-					ok = ereply->type == REDIS_REPLY_INTEGER &&
+				if (fmstate->table_type != PG_VALKEY_ZSET_TABLE)
+					ok = ereply->type == VALKEY_REPLY_INTEGER &&
 						ereply->integer == 0;
 				else
-					ok = ereply->type == REDIS_REPLY_NIL;
+					ok = ereply->type == VALKEY_REPLY_NIL;
 
 				check_reply(ereply, context,
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2680,16 +2680,16 @@ redisExecForeignUpdate(EState *estate,
 						(errcode(ERRCODE_UNIQUE_VIOLATION),
 					  errmsg("key prefix condition violation: %s", newkey)));
 
-			ereply = redisCommand(context, "RENAME %s %s", keyval, newkey);
+			ereply = valkeyCommand(context, "RENAME %s %s", keyval, newkey);
 
 			check_reply(ereply, context,
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failure renaming key %s", keyval);
 			freeReplyObject(ereply);
 
-			if (newval && fmstate->table_type == PG_REDIS_SCALAR_TABLE)
+			if (newval && fmstate->table_type == PG_VALKEY_SCALAR_TABLE)
 			{
-				ereply = redisCommand(context, "SET %s %s", newkey, newval);
+				ereply = valkeyCommand(context, "SET %s %s", newkey, newval);
 
 				check_reply(ereply, context,
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2699,14 +2699,14 @@ redisExecForeignUpdate(EState *estate,
 
 			if (fmstate->keyset)
 			{
-				ereply = redisCommand(context, "SREM %s %s", fmstate->keyset,
+				ereply = valkeyCommand(context, "SREM %s %s", fmstate->keyset,
 									  keyval);
 				check_reply(ereply, context,
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"deleting keyset element %s", keyval);
 				freeReplyObject(ereply);
 
-				ereply = redisCommand(context, "SADD %s %s", fmstate->keyset,
+				ereply = valkeyCommand(context, "SADD %s %s", fmstate->keyset,
 									  newkey);
 
 				check_reply(ereply, context,
@@ -2718,35 +2718,35 @@ redisExecForeignUpdate(EState *estate,
 		{
 			switch (fmstate->table_type)
 			{
-				case PG_REDIS_SCALAR_TABLE:
-					ereply = redisCommand(context, "SET %s %s",
+				case PG_VALKEY_SCALAR_TABLE:
+					ereply = valkeyCommand(context, "SET %s %s",
 										  fmstate->singleton_key, newkey);
 					check_reply(ereply, context,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
 					freeReplyObject(ereply);
 					break;
-				case PG_REDIS_SET_TABLE:
-					ereply = redisCommand(context, "SREM %s %s",
+				case PG_VALKEY_SET_TABLE:
+					ereply = valkeyCommand(context, "SREM %s %s",
 										  fmstate->singleton_key, keyval);
 					check_reply(ereply, context,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"removing value %s", keyval);
 					freeReplyObject(ereply);
-					ereply = redisCommand(context, "SADD %s %s",
+					ereply = valkeyCommand(context, "SADD %s %s",
 										  fmstate->singleton_key, newkey);
 					check_reply(ereply, context,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
 					freeReplyObject(ereply);
 					break;
-				case PG_REDIS_ZSET_TABLE:
+				case PG_VALKEY_ZSET_TABLE:
 					{
 						char	   *priority = newval;
 
 						if (!priority)
 						{
-							ereply = redisCommand(context, "ZSCORE %s %s",
+							ereply = valkeyCommand(context, "ZSCORE %s %s",
 												  fmstate->singleton_key,
 												  keyval);
 							check_reply(ereply, context,
@@ -2755,14 +2755,14 @@ redisExecForeignUpdate(EState *estate,
 							priority = pstrdup(ereply->str);
 							freeReplyObject(ereply);
 						}
-						ereply = redisCommand(context, "ZREM %s %s",
+						ereply = valkeyCommand(context, "ZREM %s %s",
 											  fmstate->singleton_key, keyval);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"removing set element %s", keyval);
 						freeReplyObject(ereply);
 
-						ereply = redisCommand(context, "ZADD %s %s %s",
+						ereply = valkeyCommand(context, "ZADD %s %s %s",
 											  fmstate->singleton_key,
 											  priority, newkey);
 						check_reply(ereply, context,
@@ -2771,13 +2771,13 @@ redisExecForeignUpdate(EState *estate,
 						freeReplyObject(ereply);
 					}
 					break;
-				case PG_REDIS_HASH_TABLE:
+				case PG_VALKEY_HASH_TABLE:
 					{
 						char	   *nval = newval;
 
 						if (!nval)
 						{
-							ereply = redisCommand(context, "HGET %s %s",
+							ereply = valkeyCommand(context, "HGET %s %s",
 												  fmstate->singleton_key,
 												  keyval);
 							check_reply(ereply, context,
@@ -2786,14 +2786,14 @@ redisExecForeignUpdate(EState *estate,
 							nval = pstrdup(ereply->str);
 							freeReplyObject(ereply);
 						}
-						ereply = redisCommand(context, "HDEL %s %s",
+						ereply = valkeyCommand(context, "HDEL %s %s",
 											  fmstate->singleton_key, keyval);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"removing hash element %s", keyval);
 						freeReplyObject(ereply);
 
-						ereply = redisCommand(context, "HSET %s %s %s",
+						ereply = valkeyCommand(context, "HSET %s %s %s",
 											  fmstate->singleton_key, newkey,
 											  nval);
 						check_reply(ereply, context,
@@ -2811,16 +2811,16 @@ redisExecForeignUpdate(EState *estate,
 	{
 		if (!fmstate->singleton_key)
 		{
-			Assert(fmstate->table_type == PG_REDIS_SCALAR_TABLE);
-			ereply = redisCommand(context, "SET %s %s", keyval, newval);
+			Assert(fmstate->table_type == PG_VALKEY_SCALAR_TABLE);
+			ereply = valkeyCommand(context, "SET %s %s", keyval, newval);
 		}
 		else
 		{
-			if (fmstate->table_type == PG_REDIS_ZSET_TABLE)
-				ereply = redisCommand(context, "ZADD %s %s %s",
+			if (fmstate->table_type == PG_VALKEY_ZSET_TABLE)
+				ereply = valkeyCommand(context, "ZADD %s %s %s",
 									  fmstate->singleton_key, newval, keyval);
-			else if (fmstate->table_type == PG_REDIS_HASH_TABLE)
-				ereply = redisCommand(context, "HSET %s %s %s",
+			else if (fmstate->table_type == PG_VALKEY_HASH_TABLE)
+				ereply = valkeyCommand(context, "HSET %s %s %s",
 									  fmstate->singleton_key, keyval, newval);
 			else
 				elog(ERROR, "impossible update");		/* should not happen */
@@ -2837,7 +2837,7 @@ redisExecForeignUpdate(EState *estate,
 
 		Assert(!fmstate->singleton_key);
 
-		ereply = redisCommand(context, "DEL %s ", newkey);
+		ereply = valkeyCommand(context, "DEL %s ", newkey);
 		check_reply(ereply, context,
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"could not delete key %s", newkey);
@@ -2845,13 +2845,13 @@ redisExecForeignUpdate(EState *estate,
 
 		switch (fmstate->table_type)
 		{
-			case PG_REDIS_SET_TABLE:
+			case PG_VALKEY_SET_TABLE:
 				{
 					int			i;
 
 					for (i = 0; i < nitems; i++)
 					{
-						ereply = redisCommand(context, "SADD %s %s",
+						ereply = valkeyCommand(context, "SADD %s %s",
 											  newkey, array_vals[i]);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2860,13 +2860,13 @@ redisExecForeignUpdate(EState *estate,
 					}
 				}
 				break;
-			case PG_REDIS_LIST_TABLE:
+			case PG_VALKEY_LIST_TABLE:
 				{
 					int			i;
 
 					for (i = 0; i < nitems; i++)
 					{
-						ereply = redisCommand(context, "RPUSH %s %s",
+						ereply = valkeyCommand(context, "RPUSH %s %s",
 											  newkey, array_vals[i]);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2875,7 +2875,7 @@ redisExecForeignUpdate(EState *estate,
 					}
 				}
 				break;
-			case PG_REDIS_HASH_TABLE:
+			case PG_VALKEY_HASH_TABLE:
 				{
 					int			i;
 					char	   *hk,
@@ -2885,7 +2885,7 @@ redisExecForeignUpdate(EState *estate,
 					{
 						hk = array_vals[i];
 						hv = array_vals[i + 1];
-						ereply = redisCommand(context, "HSET %s %s %s",
+						ereply = valkeyCommand(context, "HSET %s %s %s",
 											  newkey, hk, hv);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2894,7 +2894,7 @@ redisExecForeignUpdate(EState *estate,
 					}
 				}
 				break;
-			case PG_REDIS_ZSET_TABLE:
+			case PG_VALKEY_ZSET_TABLE:
 				{
 					int			i;
 					char		ibuff[100];
@@ -2909,7 +2909,7 @@ redisExecForeignUpdate(EState *estate,
 						 * score comes BEFORE value in ZADD, which seems
 						 * slightly perverse
 						 */
-						ereply = redisCommand(context, "ZADD %s %s %s",
+						ereply = valkeyCommand(context, "ZADD %s %s %s",
 											  newkey, ibuff, zval);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2932,19 +2932,19 @@ redisExecForeignUpdate(EState *estate,
 
 
 static void
-redisEndForeignModify(EState *estate,
+valkeyEndForeignModify(EState *estate,
 					  ResultRelInfo *rinfo)
 {
-	RedisFdwModifyState *fmstate = (RedisFdwModifyState *) rinfo->ri_FdwState;
+	ValkeyFdwModifyState *fmstate = (ValkeyFdwModifyState *) rinfo->ri_FdwState;
 
 #ifdef DEBUG
-	elog(NOTICE, "redisEndForeignScan");
+	elog(NOTICE, "valkeyEndForeignScan");
 #endif
 
 	/* if fmstate is NULL, we are in EXPLAIN; nothing to do */
 	if (fmstate)
 	{
 		if (fmstate->context)
-			redisFree(fmstate->context);
+			valkeyFree(fmstate->context);
 	}
 }
