@@ -189,3 +189,6 @@ dpage@pgadmin.org
 
 Andrew Dunstan
 andrew@dunslane.net
+
+Dan Molik
+dan@hyperspike.io
