@@ -15,7 +15,7 @@ warned!
 Building
 --------
 
-To build the code, you need the hiredis C interface to Valkey installed
+To build the code, you need the hivalkey C interface to Valkey installed
 on your system. You can checkout the libvalkey from
 https://github.com/valkey-io/libvalkey
 or it might be available for your OS as it is for Fedora, for example.
@@ -129,54 +129,54 @@ PostgreSQL releases. There are a few restriction on this:
 Example
 -------
 
-	CREATE EXTENSION redis_fdw;
+	CREATE EXTENSION valkey_fdw;
 
-	CREATE SERVER redis_server
-		FOREIGN DATA WRAPPER redis_fdw
+	CREATE SERVER valkey_server
+		FOREIGN DATA WRAPPER valkey_fdw
 		OPTIONS (address '127.0.0.1', port '6379');
 
-	CREATE FOREIGN TABLE redis_db0 (key text, val text)
-		SERVER redis_server
+	CREATE FOREIGN TABLE valkey_db0 (key text, val text)
+		SERVER valkey_server
 		OPTIONS (database '0');
 
 	CREATE USER MAPPING FOR PUBLIC
-		SERVER redis_server
+		SERVER valkey_server
 		OPTIONS (password 'secret');
 
-	CREATE FOREIGN TABLE myredishash (key text, val text[])
-		SERVER redis_server
+	CREATE FOREIGN TABLE myvalkeyhash (key text, val text[])
+		SERVER valkey_server
 		OPTIONS (database '0', tabletype 'hash', tablekeyprefix 'mytable:');
 
-    INSERT INTO myredishash (key, val)
+    INSERT INTO myvalkeyhash (key, val)
        VALUES ('mytable:r1','{prop1,val1,prop2,val2}');
 
-    UPDATE myredishash
+    UPDATE myvalkeyhash
         SET val = '{prop3,val3,prop4,val4}'
         WHERE key = 'mytable:r1';
 
-    DELETE from myredishash
+    DELETE from myvalkeyhash
         WHERE key = 'mytable:r1';
 
-	CREATE FOREIGN TABLE myredis_s_hash (key text, val text)
-		SERVER redis_server
+	CREATE FOREIGN TABLE myvalkey_s_hash (key text, val text)
+		SERVER valkey_server
 		OPTIONS (database '0', tabletype 'hash',  singleton_key 'mytable');
 
-    INSERT INTO myredis_s_hash (key, val)
+    INSERT INTO myvalkey_s_hash (key, val)
        VALUES ('prop1','val1'),('prop2','val2');
 
-    UPDATE myredis_s_hash
+    UPDATE myvalkey_s_hash
         SET val = 'val23'
         WHERE key = 'prop1';
 
-    DELETE from myredis_s_hash
+    DELETE from myvalkey_s_hash
         WHERE key = 'prop2';
 
 Testing
 -------
 
-The tests for 9.2 and later assume that you have access to a redis server
+The tests for 9.2 and later assume that you have access to a valkey server
 on the localmachine with no password, and uses database 15, which must be empty,
-and that the redis-cli program is in the PATH when it is run.
+and that the valkey-cli program is in the PATH when it is run.
 The test script checks that the database is empty before it tries to
 populate it, and it cleans up afterwards.
 
