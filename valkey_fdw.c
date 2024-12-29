@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include <valkey/valkey.h>
+#include <valkey/cluster.h>
 
 #include "funcapi.h"
 #include "access/reloptions.h"
@@ -109,11 +110,21 @@ typedef enum
 	PG_VALKEY_ZSET_TABLE
 } valkey_table_type;
 
+typedef enum
+{
+	VALKEY = 0,
+	VALKEY_CLUSTER,
+	VALKEY_TLS,
+	VALKEY_TLS_CLUSTER,
+} valkey_protocol;
+
 typedef struct valkeyTableOptions
 {
 	char	   *address;
 	int			port;
+	char	   *username;
 	char	   *password;
+	valkey_protocol protocol;
 	int			database;
 	char	   *keyprefix;
 	char	   *keyset;
@@ -137,10 +148,22 @@ typedef struct
 
 typedef struct ValkeyFdwExecutionState
 {
-	AttInMetadata *attinmeta;
-	valkeyContext *context;
-	valkeyReply *reply;
-	long long	row;
+	AttInMetadata        *attinmeta;
+	valkeyContext        *context;
+	valkeyClusterContext *cc;
+	valkeyReply          *reply;
+	long long             row;
+
+	bool  cluster;
+	bool  tls;
+	bool  tls_verify;
+	char *tls_ca_file;
+	char *tls_ca;
+	char *tls_cert_file;
+	char *tls_cert;
+	char *tls_key_file;
+	char *tls_key;
+
 	char	   *address;
 	int			port;
 	char	   *password;
@@ -149,15 +172,19 @@ typedef struct ValkeyFdwExecutionState
 	char	   *keyset;
 	char	   *qual_value;
 	char	   *singleton_key;
+
 	valkey_table_type table_type;
 	char	   *cursor_search_string;
 	char	   *cursor_id;
+
 	MemoryContext mctxt;
 } ValkeyFdwExecutionState;
 
 typedef struct ValkeyFdwModifyState
 {
-	valkeyContext *context;
+	valkeyContext        *context;
+	valkeyClusterContext *cc;
+
 	char	   *address;
 	int			port;
 	char	   *password;
@@ -215,6 +242,10 @@ static inline TupleTableSlot *valkeyIterateForeignScanSingleton(ForeignScanState
 static void valkeyReScanForeignScan(ForeignScanState *node);
 static void valkeyEndForeignScan(ForeignScanState *node);
 
+static valkey_protocol valkeyGetProtocol(char *address);
+static char *valkeyGetAddress(char *url);
+static char *valkeyGetUsername(char *url);
+static char *valkeyGetPassword(char *url);
 
 static List *valkeyPlanForeignModify(PlannerInfo *root,
 					   ModifyTable *plan,
@@ -255,6 +286,8 @@ static void valkeyGetQual(Node *node, TupleDesc tupdesc, char **key,
 						 char **value, bool *pushdown);
 static char *process_valkey_array(valkeyReply *reply, valkey_table_type type);
 static void check_reply(valkeyReply *reply, valkeyContext *context,
+						int error_code, char *message, char *arg);
+static void check_cluster_reply(valkeyReply *reply, valkeyClusterContext *cc,
 						int error_code, char *message, char *arg);
 
 /*
@@ -534,6 +567,7 @@ valkeyGetOptions(Oid foreigntableid, valkeyTableOptions *table_options)
 	UserMapping *mapping;
 	List	   *options;
 	ListCell   *lc;
+	char *url = NULL;
 
 #ifdef DEBUG
 	elog(NOTICE, "valkeyGetOptions");
@@ -558,17 +592,14 @@ valkeyGetOptions(Oid foreigntableid, valkeyTableOptions *table_options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
 
-		if (strcmp(def->defname, "address") == 0)
-			table_options->address = defGetString(def);
-
-		if (strcmp(def->defname, "port") == 0)
-			table_options->port = atoi(defGetString(def));
-
-		if (strcmp(def->defname, "password") == 0)
-			table_options->password = defGetString(def);
-
-		if (strcmp(def->defname, "database") == 0)
-			table_options->database = atoi(defGetString(def));
+		if (strcmp(def->defname, "url") == 0)
+		{
+			url = defGetString(def);
+			table_options->protocol = valkeyGetProtocol(url);
+			table_options->address = valkeyGetAddress(url);
+			table_options->username = valkeyGetUsername(url);
+			table_options->password = valkeyGetPassword(url);
+		}
 
 		if (strcmp(def->defname, "tablekeyprefix") == 0)
 			table_options->keyprefix = defGetString(def);
@@ -606,6 +637,106 @@ valkeyGetOptions(Oid foreigntableid, valkeyTableOptions *table_options)
 		table_options->database = 0;
 }
 
+/*
+ * get protocol from address
+ */
+static valkey_protocol valkeyGetProtocol(char *address)
+{
+	valkey_protocol protocol = VALKEY; /* default */
+	char *colon = strchr(address, ':');
+	if (colon)
+	{
+		if (strncmp(address, "valkey", colon - address) == 0)
+			protocol = VALKEY;
+		else if (strncmp(address, "valkey+cluster", colon - address) == 0)
+			protocol = VALKEY_CLUSTER;
+		else if (strncmp(address, "valkey+tls", colon - address) == 0)
+			protocol = VALKEY_TLS;
+		else if (strncmp(address, "valkey+cluster+tls", colon - address) == 0)
+			protocol = VALKEY_TLS_CLUSTER;
+		else if (strncmp(address, "valkey+tls+cluster", colon - address) == 0)
+			protocol = VALKEY_TLS_CLUSTER;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("invalid protocol in address: %s", address)
+					 ));
+	}
+	return protocol;
+}
+
+/*
+ * get address from url
+ */
+static char *valkeyGetAddress(char *url)
+{
+	char *colon = strchr(url, ':');
+	char *at = strchr(url, '@');
+	char *slash;
+	if (at)
+	{
+		slash = strchr(pstrdup(at + 1), '/');
+		if (slash)
+			return pnstrdup(at + 1, slash - at - 1);
+		else
+			return pstrdup(at + 1);
+	}
+	else
+	{
+		if (colon)
+		{
+			slash = strchr(colon + 3, '/');
+			if (slash)
+				return pnstrdup(colon + 3, slash - colon - 3);
+			else
+				return pstrdup(colon + 3);
+		}
+		else
+		{
+			slash = strchr(url, '/');
+			if (slash)
+				return pnstrdup(url, slash - url);
+			else
+				return pstrdup(url);
+		}
+	}
+}
+
+/*
+ * Get username from url
+ */
+static char *valkeyGetUsername(char *url)
+{
+	char *colon = strchr(url, ':');
+	char *at = strchr(url, '@');
+	if (at)
+	{
+		if (colon)
+			return pnstrdup(url, colon - url);
+		else
+			return pstrdup(url);
+	}
+	else
+		return NULL;
+}
+
+/*
+ * Get password from url
+ */
+static char *valkeyGetPassword(char *url)
+{
+	char *colon = strchr(url, ':');
+	char *at = strchr(url, '@');
+	if (at)
+	{
+		if (colon)
+			return pnstrdup(colon + 1, at - colon - 1);
+		else
+			return pnstrdup(url, at - url);
+	}
+	else
+		return NULL;
+}
 
 static void
 valkeyGetForeignRelSize(PlannerInfo *root,
@@ -615,7 +746,8 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 	ValkeyFdwPlanState *fdw_private;
 	valkeyTableOptions table_options;
 
-	valkeyContext *context;
+	valkeyContext        *context;
+	valkeyClusterContext *cc;
 	valkeyReply *reply;
 	struct timeval timeout = {1, 500000};
 
@@ -646,19 +778,34 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 	fdw_private->svr_database = table_options.database;
 
 	/* Connect to the database */
-	context = valkeyConnectWithTimeout(table_options.address, table_options.port,
-									  timeout);
-
-	if (context->err)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Valkey: %d", context->err)
-				 ));
+	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+	{
+		cc = valkeyClusterConnectWithTimeout(table_options.address, timeout, VALKEYCLUSTER_FLAG_NULL);
+		if (cc->err)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to connect to Valkey Cluster: %s",
+							cc->errstr)
+					 ));
+	}
+	else
+	{
+		context = valkeyConnectWithTimeout(table_options.address,
+											table_options.port, timeout);
+		if (context->err)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to connect to Valkey: %s", context->errstr)
+					 ));
+	}
 
 	/* Authenticate */
 	if (table_options.password)
 	{
-		reply = valkeyCommand(context, "AUTH %s", table_options.password);
+		if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+			reply = valkeyClusterCommand(cc, "AUTH %s", table_options.password);
+		else
+			reply = valkeyCommand(context, "AUTH %s", table_options.password);
 
 		if (!reply)
 		{
@@ -673,7 +820,10 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 	}
 
 	/* Select the appropriate database */
-	reply = valkeyCommand(context, "SELECT %d", table_options.database);
+	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+		reply = valkeyClusterCommand(cc, "SELECT %d", table_options.database);
+	else
+		reply = valkeyCommand(context, "SELECT %d", table_options.database);
 
 	if (!reply)
 	{
@@ -711,16 +861,28 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 				baserel->rows = 1;
 				return;
 			case PG_VALKEY_HASH_TABLE:
-				reply = valkeyCommand(context, "HLEN %s", table_options.singleton_key);
+				if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+					reply = valkeyClusterCommand(cc, "HLEN %s", table_options.singleton_key);
+				else
+					reply = valkeyCommand(context, "HLEN %s", table_options.singleton_key);
 				break;
 			case PG_VALKEY_LIST_TABLE:
-				reply = valkeyCommand(context, "LLEN %s", table_options.singleton_key);
+				if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+					reply = valkeyClusterCommand(cc, "LLEN %s", table_options.singleton_key);
+				else
+					reply = valkeyCommand(context, "LLEN %s", table_options.singleton_key);
 				break;
 			case PG_VALKEY_SET_TABLE:
-				reply = valkeyCommand(context, "SCARD %s", table_options.singleton_key);
+				if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+					reply = valkeyClusterCommand(cc, "SCARD %s", table_options.singleton_key);
+				else
+					reply = valkeyCommand(context, "SCARD %s", table_options.singleton_key);
 				break;
 			case PG_VALKEY_ZSET_TABLE:
-				reply = valkeyCommand(context, "ZCARD %s", table_options.singleton_key);
+				if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+					reply = valkeyClusterCommand(cc, "ZCARD %s", table_options.singleton_key);
+				else
+					reply = valkeyCommand(context, "ZCARD %s", table_options.singleton_key);
 				break;
 			default:
 				;
@@ -728,11 +890,17 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 	}
 	else if (table_options.keyset)
 	{
-		reply = valkeyCommand(context, "SCARD %s", table_options.keyset);
+		if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+			reply = valkeyClusterCommand(cc, "SCARD %s", table_options.keyset);
+		else
+			reply = valkeyCommand(context, "SCARD %s", table_options.keyset);
 	}
 	else
 	{
-		reply = valkeyCommand(context, "DBSIZE");
+		if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+			reply = valkeyClusterCommand(cc, "DBSIZE");
+		else
+			reply = valkeyCommand(context, "DBSIZE");
 	}
 
 	if (!reply)
@@ -755,9 +923,10 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 		baserel->rows = reply->integer;
 
 	freeReplyObject(reply);
-	valkeyFree(context);
-
-
+	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+		valkeyClusterFree(cc);
+	else
+		valkeyFree(context);
 }
 
 /*
@@ -1830,10 +1999,12 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 						int subplan_index,
 						int eflags)
 {
-	valkeyTableOptions table_options;
-	valkeyContext *context;
-	valkeyReply *reply;
+	valkeyTableOptions    table_options;
+	valkeyContext        *context;
+	valkeyClusterContext *cc;
+	valkeyReply          *reply;
 	ValkeyFdwModifyState *fmstate;
+
 	struct timeval timeout = {1, 500000};
 	Relation	rel = rinfo->ri_RelationDesc;
 	ListCell   *lc;
@@ -1992,22 +2163,41 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 		return;
 
 	/* Finally, Connect to the server and set the Valkey execution context */
-	context = valkeyConnectWithTimeout(table_options.address,
+	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+	{
+		cc = valkeyClusterConnectWithTimeout(table_options.address, timeout, VALKEYCLUSTER_FLAG_NULL);
+
+		if (cc->err)
+		{
+			valkeyClusterFree(cc);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to connect to Valkey cluster: %s", cc->errstr)
+					 ));
+		}
+	}
+	else
+	{
+		context = valkeyConnectWithTimeout(table_options.address,
 									  table_options.port, timeout);
 
-	if (context->err)
-	{
-		valkeyFree(context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Valkey: %s", context->errstr)
-				 ));
+		if (context->err)
+		{
+			valkeyFree(context);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to connect to Valkey: %s", context->errstr)
+					 ));
+		}
 	}
 
 	/* Authenticate */
 	if (table_options.password)
 	{
-		reply = valkeyCommand(context, "AUTH %s", table_options.password);
+		if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+			reply = valkeyClusterCommand(cc, "AUTH %s", table_options.password);
+		else
+			reply = valkeyCommand(context, "AUTH %s", table_options.password);
 
 		if (!reply)
 		{
@@ -2022,15 +2212,21 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 	}
 
 	/* Select the appropriate database */
-	reply = valkeyCommand(context, "SELECT %d", table_options.database);
-
-	check_reply(reply, context, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
-				"failed to select database", NULL);
-
+	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+	{
+		reply = valkeyClusterCommand(cc, "SELECT %d", table_options.database);
+		check_cluster_reply(reply, cc, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+							"failed to select database", NULL);
+		fmstate->cc = cc;
+	}
+	else
+	{
+		reply = valkeyCommand(context, "SELECT %d", table_options.database);
+		check_reply(reply, context, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+					"failed to select database", NULL);
+		fmstate->context = context;
+	}
 	freeReplyObject(reply);
-
-	fmstate->context = context;
-
 }
 
 static void
@@ -2070,6 +2266,43 @@ check_reply(valkeyReply *reply, valkeyContext *context, int error_code, char *me
 				 ));
 }
 
+static void
+check_cluster_reply(valkeyReply *reply, valkeyClusterContext *cc, int error_code, char *message, char *arg)
+{
+	char	   *err;
+	char	   *xmessage;
+	int         msglen;
+
+	if (!reply)
+	{
+		err = pstrdup(cc->errstr);
+		valkeyClusterFree(cc);
+	}
+	else if (reply->type == VALKEY_REPLY_ERROR)
+	{
+		err = pstrdup(reply->str);
+		freeReplyObject(reply);
+	}
+	else
+		return;
+
+	msglen = strlen(message);
+	xmessage = palloc(msglen + 6);
+	strncpy(xmessage, message, msglen + 1);
+	strcat(xmessage, ": %s");
+
+	if (arg != NULL)
+		ereport(ERROR,
+				(errcode(error_code),
+				 errmsg(xmessage, arg, err)
+				 ));
+	else
+		ereport(ERROR,
+				(errcode(error_code),
+				 errmsg(xmessage, err)
+				 ));
+}
+
 static TupleTableSlot *
 valkeyExecForeignInsert(EState *estate,
 					   ResultRelInfo *rinfo,
@@ -2079,11 +2312,16 @@ valkeyExecForeignInsert(EState *estate,
 	ValkeyFdwModifyState *fmstate =
 	(ValkeyFdwModifyState *) rinfo->ri_FdwState;
 	valkeyContext *context = fmstate->context;
+	valkeyClusterContext *cc = fmstate->cc;
 	valkeyReply *sreply = NULL;
 	bool		isnull;
+	bool		iscluster = false;
 	Datum		key;
 	char	   *keyval;
 	char	   *extraval = "";	/* hash value or zset priority */
+
+	if (cc != NULL)
+		iscluster = true;
 
 #ifdef DEBUG
 	elog(NOTICE, "valkeyExecForeignInsert");
@@ -2112,21 +2350,36 @@ valkeyExecForeignInsert(EState *estate,
 		switch (fmstate->table_type)
 		{
 			case PG_VALKEY_SCALAR_TABLE:
-				sreply = valkeyCommand(context, "EXISTS %s",		/* 1 or 0 */
-									  fmstate->singleton_key);
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "EXISTS %s",		/* 1 or 0 */
+									fmstate->singleton_key);
+				else
+					sreply = valkeyCommand(context, "EXISTS %s",		/* 1 or 0 */
+									fmstate->singleton_key);
 				break;
 			case PG_VALKEY_HASH_TABLE:
-				sreply = valkeyCommand(context, "HEXISTS %s %s", /* 1 or 0 */
-									  fmstate->singleton_key, keyval);
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "HEXISTS %s %s",	/* 1 or 0 */
+									fmstate->singleton_key, keyval);
+				else
+					sreply = valkeyCommand(context, "HEXISTS %s %s",	/* 1 or 0 */
+									fmstate->singleton_key, keyval);
 				break;
 			case PG_VALKEY_SET_TABLE:
-				sreply = valkeyCommand(context, "SISMEMBER %s %s",		/* 1 or 0 */
-									  fmstate->singleton_key, keyval);
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "SISMEMBER %s %s",	/* 1 or 0 */
+									fmstate->singleton_key, keyval);
+				else
+					sreply = valkeyCommand(context, "SISMEMBER %s %s",	/* 1 or 0 */
+									fmstate->singleton_key, keyval);
 				break;
 			case PG_VALKEY_ZSET_TABLE:
-				sreply = valkeyCommand(context, "ZRANK %s %s",	/* n or nil */
-
-									  fmstate->singleton_key, keyval);
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "ZRANK %s %s",	/* n or nil */
+									fmstate->singleton_key, keyval);
+				else
+					sreply = valkeyCommand(context, "ZRANK %s %s",	/* n or nil */
+									fmstate->singleton_key, keyval);
 				break;
 			case PG_VALKEY_LIST_TABLE:
 			default:
@@ -2138,7 +2391,11 @@ valkeyExecForeignInsert(EState *estate,
 
 			bool		ok = true;
 
-			check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+			if (iscluster)
+				check_cluster_reply(sreply, cc, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+						"failed checking key existence", NULL);
+			else
+				check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed checking key existence", NULL);
 
 			if (fmstate->table_type != PG_VALKEY_ZSET_TABLE)
@@ -2173,19 +2430,35 @@ valkeyExecForeignInsert(EState *estate,
 		switch (fmstate->table_type)
 		{
 			case PG_VALKEY_SCALAR_TABLE:
-				sreply = valkeyCommand(context, "SET %s %s",
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "SET %s %s",
+									  fmstate->singleton_key, keyval);
+				else
+					sreply = valkeyCommand(context, "SET %s %s",
 									  fmstate->singleton_key, keyval);
 				break;
 			case PG_VALKEY_SET_TABLE:
-				sreply = valkeyCommand(context, "SADD %s %s",
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "SADD %s %s",
+									  fmstate->singleton_key, keyval);
+				else
+					sreply = valkeyCommand(context, "SADD %s %s",
 									  fmstate->singleton_key, keyval);
 				break;
 			case PG_VALKEY_LIST_TABLE:
-				sreply = valkeyCommand(context, "RPUSH %s %s",
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "RPUSH %s %s",
+									  fmstate->singleton_key, keyval);
+				else
+					sreply = valkeyCommand(context, "RPUSH %s %s",
 									  fmstate->singleton_key, keyval);
 				break;
 			case PG_VALKEY_HASH_TABLE:
-				sreply = valkeyCommand(context, "HSET %s %s %s",
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "HSET %s %s %s",
+									  fmstate->singleton_key, keyval, extraval);
+				else
+					sreply = valkeyCommand(context, "HSET %s %s %s",
 								   fmstate->singleton_key, keyval, extraval);
 				break;
 			case PG_VALKEY_ZSET_TABLE:
@@ -2194,7 +2467,11 @@ valkeyExecForeignInsert(EState *estate,
 				 * score comes BEFORE value in ZADD, which seems slightly
 				 * perverse
 				 */
-				sreply = valkeyCommand(context, "ZADD %s %s %s",
+				if (iscluster)
+					sreply = valkeyClusterCommand(cc, "ZADD %s %s %s",
+									  fmstate->singleton_key, extraval, keyval);
+				else
+					sreply = valkeyCommand(context, "ZADD %s %s %s",
 								   fmstate->singleton_key, extraval, keyval);
 				break;
 			default:
@@ -2204,7 +2481,11 @@ valkeyExecForeignInsert(EState *estate,
 						 ));
 		}
 
-		check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+		if (iscluster)
+			check_cluster_reply(sreply, cc, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"cannot insert value for key %s", keyval);
+		else
+			check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"cannot insert value for key %s", keyval);
 		freeReplyObject(sreply);
 	}
@@ -2256,10 +2537,19 @@ valkeyExecForeignInsert(EState *estate,
 					 ));
 
 		/* Check if key is there using EXISTS  */
-		sreply = valkeyCommand(context, "EXISTS %s",		/* 1 or 0 */
+		if (iscluster) {
+			sreply = valkeyClusterCommand(cc, "EXISTS %s",		/* 1 or 0 */
 							  keyval);
-		check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+			check_cluster_reply(sreply, cc, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"failed checking key existence", NULL);
+		}
+		else
+		{
+			sreply = valkeyCommand(context, "EXISTS %s",		/* 1 or 0 */
+							  keyval);
+			check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"failed checking key existence", NULL);
+		}
 
 		if (sreply->type != VALKEY_REPLY_INTEGER || sreply->integer != 0)
 		{
@@ -2315,11 +2605,21 @@ valkeyExecForeignInsert(EState *estate,
 		switch (fmstate->table_type)
 		{
 			case PG_VALKEY_SCALAR_TABLE:
-				sreply = valkeyCommand(context, "SET %s %s",
+				if (iscluster)
+				{
+					sreply = valkeyClusterCommand(cc, "SET %s %s",
 									  keyval, valueval);
-				check_reply(sreply, context,
-							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					check_cluster_reply(sreply, cc, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"could not add key %s", keyval);
+				}
+				else
+				{
+					sreply = valkeyCommand(context, "SET %s %s",
+										  keyval, valueval);
+					check_reply(sreply, context,
+								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								"could not add key %s", keyval);
+				}
 				freeReplyObject(sreply);
 				break;
 			case PG_VALKEY_SET_TABLE:
@@ -2330,11 +2630,22 @@ valkeyExecForeignInsert(EState *estate,
 					{
 						valueval = OutputFunctionCall(&fmstate->p_flinfo[1],
 													  elements[i]);
-						sreply = valkeyCommand(context, "SADD %s %s",
+						if (iscluster)
+						{
+							sreply = valkeyClusterCommand(cc, "SADD %s %s",
 											  keyval, valueval);
-						check_reply(sreply, context,
+							check_cluster_reply(sreply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add set member %s", valueval);
+						}
+						else
+						{
+							sreply = valkeyCommand(context, "SADD %s %s",
+											  keyval, valueval);
+							check_reply(sreply, context,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"could not add set member %s", valueval);
+						}
 						freeReplyObject(sreply);
 					}
 				}
@@ -2347,11 +2658,22 @@ valkeyExecForeignInsert(EState *estate,
 					{
 						valueval = OutputFunctionCall(&fmstate->p_flinfo[1],
 													  elements[i]);
-						sreply = valkeyCommand(context, "RPUSH %s %s",
+						if (iscluster)
+						{
+							sreply = valkeyClusterCommand(cc, "RPUSH %s %s",
 											  keyval, valueval);
-						check_reply(sreply, context,
+							check_cluster_reply(sreply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add value %s", valueval);
+						}
+						else
+						{
+							sreply = valkeyCommand(context, "RPUSH %s %s",
+												  keyval, valueval);
+							check_reply(sreply, context,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"could not add value %s", valueval);
+						}
 					}
 				}
 				break;
@@ -2367,11 +2689,22 @@ valkeyExecForeignInsert(EState *estate,
 												elements[i]);
 						hv = OutputFunctionCall(&fmstate->p_flinfo[1],
 												elements[i + 1]);
-						sreply = valkeyCommand(context, "HSET %s %s %s",
+						if (iscluster)
+						{
+							sreply = valkeyClusterCommand(cc, "HSET %s %s %s",
 											  keyval, hk, hv);
-						check_reply(sreply, context,
+							check_cluster_reply(sreply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add key %s", hk);
+						}
+						else
+						{
+							sreply = valkeyCommand(context, "HSET %s %s %s",
+											  keyval, hk, hv);
+							check_reply(sreply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"could not add key %s", hk);
+						}
 						freeReplyObject(sreply);
 					}
 				}
@@ -2391,11 +2724,22 @@ valkeyExecForeignInsert(EState *estate,
 						 * score comes BEFORE value in ZADD, which seems
 						 * slightly perverse
 						 */
-						sreply = valkeyCommand(context, "ZADD %s %s %s",
+						if (iscluster)
+						{
+							sreply = valkeyClusterCommand(cc, "ZADD %s %s %s",
 											  keyval, ibuff, valueval);
-						check_reply(sreply, context,
+							check_cluster_reply(sreply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add key %s", valueval);
+						}
+						else
+						{
+							sreply = valkeyCommand(context, "ZADD %s %s %s",
+												  keyval, ibuff, valueval);
+							check_reply(sreply, context,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"could not add key %s", valueval);
+						}
 						freeReplyObject(sreply);
 					}
 				}
@@ -2411,11 +2755,22 @@ valkeyExecForeignInsert(EState *estate,
 
 		if (fmstate->keyset)
 		{
-			sreply = valkeyCommand(context, "SADD %s %s",
+			if (iscluster)
+			{
+				sreply = valkeyClusterCommand(cc, "SADD %s %s",
 								  fmstate->keyset, keyval);
-			check_reply(sreply, context,
-						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-						"could not add keyset element %s", valueval);
+				check_cluster_reply(sreply, cc,
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"could not add keyset element %s", valueval);
+			}
+			else
+			{
+				sreply = valkeyCommand(context, "SADD %s %s",
+									  fmstate->keyset, keyval);
+				check_reply(sreply, context,
+							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+							"could not add keyset element %s", valueval);
+			}
 			freeReplyObject(sreply);
 		}
 	}
@@ -2431,10 +2786,15 @@ valkeyExecForeignDelete(EState *estate,
 	ValkeyFdwModifyState *fmstate =
 	(ValkeyFdwModifyState *) rinfo->ri_FdwState;
 	valkeyContext *context = fmstate->context;
+	valkeyClusterContext *cc = fmstate->cc;
+	bool		iscluster = false;
 	valkeyReply *reply = NULL;
 	bool		isNull;
 	Datum		datum;
 	char	   *keyval;
+
+	if (cc != NULL)
+		iscluster = true;
 
 #ifdef DEBUG
 	elog(NOTICE, "valkeyExecForeignDelete");
@@ -2454,19 +2814,35 @@ valkeyExecForeignDelete(EState *estate,
 		switch (fmstate->table_type)
 		{
 			case PG_VALKEY_SCALAR_TABLE:
-				reply = valkeyCommand(context, "DEL %s",
+				if (iscluster)
+					reply = valkeyClusterCommand(cc, "DEL %s",
+									 fmstate->singleton_key);
+				else
+					reply = valkeyCommand(context, "DEL %s",
 									 fmstate->singleton_key);
 				break;
 			case PG_VALKEY_SET_TABLE:
-				reply = valkeyCommand(context, "SREM %s %s",
+				if (iscluster)
+					reply = valkeyClusterCommand(cc, "SREM %s %s",
+									 fmstate->singleton_key, keyval);
+				else
+					reply = valkeyCommand(context, "SREM %s %s",
 									 fmstate->singleton_key, keyval);
 				break;
 			case PG_VALKEY_HASH_TABLE:
-				reply = valkeyCommand(context, "HDEL %s %s",
+				if (iscluster)
+					reply = valkeyClusterCommand(cc, "HDEL %s %s",
+									 fmstate->singleton_key, keyval);
+				else
+					reply = valkeyCommand(context, "HDEL %s %s",
 									 fmstate->singleton_key, keyval);
 				break;
 			case PG_VALKEY_ZSET_TABLE:
-				reply = valkeyCommand(context, "ZREM %s %s",
+				if (iscluster)
+					reply = valkeyClusterCommand(cc, "ZREM %s %s",
+									 fmstate->singleton_key, keyval);
+				else
+					reply = valkeyCommand(context, "ZREM %s %s",
 									 fmstate->singleton_key, keyval);
 				break;
 			default:
@@ -2480,7 +2856,10 @@ valkeyExecForeignDelete(EState *estate,
 	else	/* not a singleton */
 	{
 		/* use DEL regardless of table type */
-		reply = valkeyCommand(context, "DEL %s", keyval);
+		if (iscluster)
+			reply = valkeyClusterCommand(cc, "DEL %s", keyval);
+		else
+			reply = valkeyCommand(context, "DEL %s", keyval);
 	}
 
 	check_reply(reply, context,
@@ -2490,12 +2869,23 @@ valkeyExecForeignDelete(EState *estate,
 
 	if (fmstate->keyset)
 	{
-		reply = valkeyCommand(context, "SREM %s %s",
+		if (iscluster)
+		{
+			reply = valkeyClusterCommand(cc, "SREM %s %s",
 							 fmstate->keyset, keyval);
-
-		check_reply(reply, context,
+			check_cluster_reply(reply, cc,
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"failed to delete keyset element %s", keyval);
+		}
+		else
+		{
+			reply = valkeyCommand(context, "SREM %s %s",
+								 fmstate->keyset, keyval);
+
+			check_reply(reply, context,
+						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+						"failed to delete keyset element %s", keyval);
+		}
 		freeReplyObject(reply);
 
 	}
@@ -2511,8 +2901,12 @@ valkeyExecForeignUpdate(EState *estate,
 {
 	ValkeyFdwModifyState *fmstate =
 	(ValkeyFdwModifyState *) rinfo->ri_FdwState;
-	valkeyContext *context = fmstate->context;
-	valkeyReply *ereply = NULL;
+
+	valkeyContext        *context  = fmstate->context;
+	valkeyClusterContext *cc       = fmstate->cc;
+	valkeyReply          *ereply   = NULL;
+	bool                 iscluster = false;
+
 	Datum		datum;
 	char	   *keyval;
 	char	   *newkey;
@@ -2522,6 +2916,9 @@ valkeyExecForeignUpdate(EState *estate,
 	ListCell   *lc = NULL;
 	int			flslot = 1;
 	int			nitems = 0;
+
+	if (cc != NULL)
+		iscluster = true;
 
 #ifdef DEBUG
 	elog(NOTICE, "valkeyExecForeignUpdate");
@@ -2625,26 +3022,49 @@ valkeyExecForeignUpdate(EState *estate,
 		/* make sure the new key doesn't exist */
 		if (!fmstate->singleton_key)
 		{
-			ereply = valkeyCommand(context, "EXISTS %s", newkey);
-			ok = ereply->type == VALKEY_REPLY_INTEGER && ereply->integer == 0;
-			check_reply(ereply, context,
+			if (iscluster)
+			{
+				ereply = valkeyClusterCommand(cc, "EXISTS %s", newkey);
+				ok = ereply->type == VALKEY_REPLY_INTEGER && ereply->integer == 0;
+				check_cluster_reply(ereply, cc,
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed checking key existence %s", newkey);
+			}
+			else
+			{
+				ereply = valkeyCommand(context, "EXISTS %s", newkey);
+				ok = ereply->type == VALKEY_REPLY_INTEGER && ereply->integer == 0;
+				check_reply(ereply, context,
+						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+						"failed checking key existence %s", newkey);
+			}
 		}
 		else
 		{
 			switch (fmstate->table_type)
 			{
 				case PG_VALKEY_SET_TABLE:
-					ereply = valkeyCommand(context, "SISMEMBER %s %s",
+					if (iscluster)
+						ereply = valkeyClusterCommand(cc, "SISMEMBER %s %s",
+										  fmstate->singleton_key, newkey);
+					else
+						ereply = valkeyCommand(context, "SISMEMBER %s %s",
 										  fmstate->singleton_key, newkey);
 					break;
 				case PG_VALKEY_ZSET_TABLE:
-					ereply = valkeyCommand(context, "ZRANK %s %s",
+					if (iscluster)
+						ereply = valkeyClusterCommand(cc, "ZRANK %s %s",
+										  fmstate->singleton_key, newkey);
+					else
+						ereply = valkeyCommand(context, "ZRANK %s %s",
 										  fmstate->singleton_key, newkey);
 					break;
 				case PG_VALKEY_HASH_TABLE:
-					ereply = valkeyCommand(context, "HEXISTS %s %s",
+					if (iscluster)
+						ereply = valkeyClusterCommand(cc, "HEXISTS %s %s",
+										  fmstate->singleton_key, newkey);
+					else
+						ereply = valkeyCommand(context, "HEXISTS %s %s",
 										  fmstate->singleton_key, newkey);
 					break;
 				default:
@@ -2680,64 +3100,137 @@ valkeyExecForeignUpdate(EState *estate,
 						(errcode(ERRCODE_UNIQUE_VIOLATION),
 					  errmsg("key prefix condition violation: %s", newkey)));
 
-			ereply = valkeyCommand(context, "RENAME %s %s", keyval, newkey);
-
-			check_reply(ereply, context,
+			if (iscluster)
+			{
+				ereply = valkeyClusterCommand(cc, "RENAME %s %s", keyval, newkey);
+				check_cluster_reply(ereply, cc,
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failure renaming key %s", keyval);
+			} else {
+				ereply = valkeyCommand(context, "RENAME %s %s", keyval, newkey);
+				check_reply(ereply, context,
+						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+						"failure renaming key %s", keyval);
+			}
 			freeReplyObject(ereply);
 
 			if (newval && fmstate->table_type == PG_VALKEY_SCALAR_TABLE)
 			{
-				ereply = valkeyCommand(context, "SET %s %s", newkey, newval);
-
-				check_reply(ereply, context,
+				if (iscluster)
+				{
+					ereply = valkeyClusterCommand(cc, "SET %s %s", newkey, newval);
+					check_cluster_reply(ereply, cc,
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"upating key %s", newkey);
+				}
+				else
+				{
+					ereply = valkeyCommand(context, "SET %s %s", newkey, newval);
+
+					check_reply(ereply, context,
+								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								"upating key %s", newkey);
+				}
 				freeReplyObject(ereply);
 			}
 
 			if (fmstate->keyset)
 			{
-				ereply = valkeyCommand(context, "SREM %s %s", fmstate->keyset,
+				if (iscluster)
+				{
+					ereply = valkeyClusterCommand(cc, "SREM %s %s", fmstate->keyset,
 									  keyval);
-				check_reply(ereply, context,
+					check_cluster_reply(ereply, cc,
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"deleting keyset element %s", keyval);
+				}
+				else
+				{
+					ereply = valkeyCommand(context, "SREM %s %s", fmstate->keyset,
+									  keyval);
+					check_reply(ereply, context,
+								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								"deleting keyset element %s", keyval);
+				}
 				freeReplyObject(ereply);
 
-				ereply = valkeyCommand(context, "SADD %s %s", fmstate->keyset,
+				if (iscluster)
+				{
+					ereply = valkeyClusterCommand(cc, "SADD %s %s", fmstate->keyset,
 									  newkey);
-
-				check_reply(ereply, context,
+					check_cluster_reply(ereply, cc,
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"adding keyset element %s", newkey);
-				freeReplyObject(ereply);			}
+				}
+				else
+				{
+					ereply = valkeyCommand(context, "SADD %s %s", fmstate->keyset,
+										  newkey);
+
+					check_reply(ereply, context,
+								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								"adding keyset element %s", newkey);
+				}
+				freeReplyObject(ereply);
+			}
 		}
 		else	/* is a singleton */
 		{
 			switch (fmstate->table_type)
 			{
 				case PG_VALKEY_SCALAR_TABLE:
-					ereply = valkeyCommand(context, "SET %s %s",
+					if (iscluster)
+					{
+						ereply = valkeyClusterCommand(cc, "SET %s %s",
 										  fmstate->singleton_key, newkey);
-					check_reply(ereply, context,
+						check_cluster_reply(ereply, cc,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
+					}
+					else
+					{
+						ereply = valkeyCommand(context, "SET %s %s",
+											  fmstate->singleton_key, newkey);
+						check_reply(ereply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"setting value %s", newkey);
+					}
 					freeReplyObject(ereply);
 					break;
 				case PG_VALKEY_SET_TABLE:
-					ereply = valkeyCommand(context, "SREM %s %s",
+					if (iscluster)
+					{
+						ereply = valkeyClusterCommand(cc, "SREM %s %s",
 										  fmstate->singleton_key, keyval);
-					check_reply(ereply, context,
+						check_cluster_reply(ereply, cc,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"removing value %s", keyval);
+					}
+					else
+					{
+						ereply = valkeyCommand(context, "SREM %s %s",
+										  fmstate->singleton_key, keyval);
+						check_reply(ereply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"removing value %s", keyval);
+					}
 					freeReplyObject(ereply);
-					ereply = valkeyCommand(context, "SADD %s %s",
+					if (iscluster)
+					{
+						ereply = valkeyClusterCommand(cc, "SADD %s %s",
 										  fmstate->singleton_key, newkey);
-					check_reply(ereply, context,
+						check_cluster_reply(ereply, cc,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
+					}
+					else
+					{
+						ereply = valkeyCommand(context, "SADD %s %s",
+										  fmstate->singleton_key, newkey);
+						check_reply(ereply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"setting value %s", newkey);
+					}
 					freeReplyObject(ereply);
 					break;
 				case PG_VALKEY_ZSET_TABLE:
@@ -2746,28 +3239,63 @@ valkeyExecForeignUpdate(EState *estate,
 
 						if (!priority)
 						{
-							ereply = valkeyCommand(context, "ZSCORE %s %s",
+							if (iscluster)
+							{
+								ereply = valkeyClusterCommand(cc, "ZSCORE %s %s",
 												  fmstate->singleton_key,
 												  keyval);
-							check_reply(ereply, context,
-									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								check_cluster_reply(ereply, cc,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"getting score for key %s", keyval);
+							}
+							else
+							{
+								ereply = valkeyCommand(context, "ZSCORE %s %s",
+												  fmstate->singleton_key,
+												  keyval);
+								check_reply(ereply, context,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"getting score for key %s", keyval);
+							}
 							priority = pstrdup(ereply->str);
 							freeReplyObject(ereply);
 						}
-						ereply = valkeyCommand(context, "ZREM %s %s",
-											  fmstate->singleton_key, keyval);
-						check_reply(ereply, context,
+						if (iscluster)
+						{
+							ereply = valkeyClusterCommand(cc, "ZREM %s %s",
+												  fmstate->singleton_key, keyval);
+							check_cluster_reply(ereply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"removing set element %s", keyval);
+						}
+						else
+						{
+							ereply = valkeyCommand(context, "ZREM %s %s",
+												  fmstate->singleton_key, keyval);
+							check_reply(ereply, context,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"removing set element %s", keyval);
+						}
 						freeReplyObject(ereply);
 
-						ereply = valkeyCommand(context, "ZADD %s %s %s",
-											  fmstate->singleton_key,
-											  priority, newkey);
-						check_reply(ereply, context,
+						if (iscluster)
+						{
+							ereply = valkeyClusterCommand(cc, "ZADD %s %s %s",
+												  fmstate->singleton_key,
+												  priority, newkey);
+							check_cluster_reply(ereply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"setting element %s", newkey);
+						}
+						else
+						{
+							ereply = valkeyCommand(context, "ZADD %s %s %s",
+												  fmstate->singleton_key,
+												  priority, newkey);
+							check_reply(ereply, context,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"setting element %s", newkey);
+						}
 						freeReplyObject(ereply);
 					}
 					break;
@@ -2777,28 +3305,63 @@ valkeyExecForeignUpdate(EState *estate,
 
 						if (!nval)
 						{
-							ereply = valkeyCommand(context, "HGET %s %s",
+							if (iscluster)
+							{
+								ereply = valkeyClusterCommand(cc, "HGET %s %s",
 												  fmstate->singleton_key,
 												  keyval);
-							check_reply(ereply, context,
-									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-										"fetching vcalue for key %s", keyval);
+								check_cluster_reply(ereply, cc,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"fetching value for key %s", keyval);
+							}
+							else
+							{
+								ereply = valkeyCommand(context, "HGET %s %s",
+													  fmstate->singleton_key,
+													  keyval);
+								check_reply(ereply, context,
+										  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+											"fetching vcalue for key %s", keyval);
+							}
 							nval = pstrdup(ereply->str);
 							freeReplyObject(ereply);
 						}
-						ereply = valkeyCommand(context, "HDEL %s %s",
-											  fmstate->singleton_key, keyval);
-						check_reply(ereply, context,
+						if (iscluster)
+						{
+							ereply = valkeyClusterCommand(cc, "HDEL %s %s",
+												  fmstate->singleton_key, keyval);
+							check_cluster_reply(ereply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"removing hash element %s", keyval);
+						}
+						else
+						{
+							ereply = valkeyCommand(context, "HDEL %s %s",
+												  fmstate->singleton_key, keyval);
+							check_reply(ereply, context,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"removing hash element %s", keyval);
+						}
 						freeReplyObject(ereply);
 
-						ereply = valkeyCommand(context, "HSET %s %s %s",
-											  fmstate->singleton_key, newkey,
-											  nval);
-						check_reply(ereply, context,
+						if (iscluster)
+						{
+							ereply = valkeyClusterCommand(cc, "HSET %s %s %s",
+												  fmstate->singleton_key, newkey,
+												  nval);
+							check_cluster_reply(ereply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"adding hash element %s", newkey);
+						}
+						else
+						{
+							ereply = valkeyCommand(context, "HSET %s %s %s",
+												  fmstate->singleton_key, newkey,
+												  nval);
+							check_reply(ereply, context,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										"adding hash element %s", newkey);
+						}
 						freeReplyObject(ereply);
 					}
 					break;
@@ -2812,21 +3375,37 @@ valkeyExecForeignUpdate(EState *estate,
 		if (!fmstate->singleton_key)
 		{
 			Assert(fmstate->table_type == PG_VALKEY_SCALAR_TABLE);
-			ereply = valkeyCommand(context, "SET %s %s", keyval, newval);
+			if (iscluster)
+				ereply = valkeyClusterCommand(cc, "SET %s %s", keyval, newval);
+			else
+				ereply = valkeyCommand(context, "SET %s %s", keyval, newval);
 		}
 		else
 		{
 			if (fmstate->table_type == PG_VALKEY_ZSET_TABLE)
-				ereply = valkeyCommand(context, "ZADD %s %s %s",
+				if (iscluster)
+					ereply = valkeyClusterCommand(cc, "ZADD %s %s %s",
+									  fmstate->singleton_key, "0", newval);
+				else
+					ereply = valkeyCommand(context, "ZADD %s %s %s",
 									  fmstate->singleton_key, newval, keyval);
 			else if (fmstate->table_type == PG_VALKEY_HASH_TABLE)
-				ereply = valkeyCommand(context, "HSET %s %s %s",
+				if (iscluster)
+					ereply = valkeyClusterCommand(cc, "HSET %s %s %s",
+									  fmstate->singleton_key, keyval, newval);
+				else
+					ereply = valkeyCommand(context, "HSET %s %s %s",
 									  fmstate->singleton_key, keyval, newval);
 			else
 				elog(ERROR, "impossible update");		/* should not happen */
 		}
 
-		check_reply(ereply, context,
+		if (iscluster)
+			check_cluster_reply(ereply, cc,
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"setting key %s", keyval);
+		else
+			check_reply(ereply, context,
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"setting key %s", keyval);
 		freeReplyObject(ereply);
@@ -2837,10 +3416,20 @@ valkeyExecForeignUpdate(EState *estate,
 
 		Assert(!fmstate->singleton_key);
 
-		ereply = valkeyCommand(context, "DEL %s ", newkey);
-		check_reply(ereply, context,
+		if (iscluster)
+		{
+			ereply = valkeyClusterCommand(cc, "DEL %s ", newkey);
+			check_cluster_reply(ereply, cc,
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"could not delete key %s", newkey);
+		}
+		else
+		{
+			ereply = valkeyCommand(context, "DEL %s ", newkey);
+			check_reply(ereply, context,
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"could not delete key %s", newkey);
+		}
 		freeReplyObject(ereply);
 
 		switch (fmstate->table_type)
@@ -2851,11 +3440,22 @@ valkeyExecForeignUpdate(EState *estate,
 
 					for (i = 0; i < nitems; i++)
 					{
-						ereply = valkeyCommand(context, "SADD %s %s",
+						if (iscluster)
+						{
+							ereply = valkeyClusterCommand(cc, "SADD %s %s",
 											  newkey, array_vals[i]);
-						check_reply(ereply, context,
+							check_cluster_reply(ereply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add element %s", array_vals[i]);
+						}
+						else
+						{
+							ereply = valkeyCommand(context, "SADD %s %s",
+											  newkey, array_vals[i]);
+							check_reply(ereply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"could not add element %s", array_vals[i]);
+						}
 						freeReplyObject(ereply);
 					}
 				}
@@ -2885,11 +3485,22 @@ valkeyExecForeignUpdate(EState *estate,
 					{
 						hk = array_vals[i];
 						hv = array_vals[i + 1];
-						ereply = valkeyCommand(context, "HSET %s %s %s",
+						if (iscluster)
+						{
+							ereply = valkeyClusterCommand(cc, "HSET %s %s %s",
 											  newkey, hk, hv);
-						check_reply(ereply, context,
+							check_cluster_reply(ereply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add key %s", hk);
+						}
+						else
+						{
+							ereply = valkeyCommand(context, "HSET %s %s %s",
+											  newkey, hk, hv);
+							check_reply(ereply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"could not add key %s", hk);
+						}
 						freeReplyObject(ereply);
 					}
 				}
@@ -2909,11 +3520,22 @@ valkeyExecForeignUpdate(EState *estate,
 						 * score comes BEFORE value in ZADD, which seems
 						 * slightly perverse
 						 */
-						ereply = valkeyCommand(context, "ZADD %s %s %s",
+						if (iscluster)
+						{
+							ereply = valkeyClusterCommand(cc, "ZADD %s %s %s",
 											  newkey, ibuff, zval);
-						check_reply(ereply, context,
+							check_cluster_reply(ereply, cc,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add key %s", zval);
+						}
+						else
+						{
+							ereply = valkeyCommand(context, "ZADD %s %s %s",
+											  newkey, ibuff, zval);
+							check_reply(ereply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"could not add key %s", zval);
+						}
 						freeReplyObject(ereply);
 					}
 				}
