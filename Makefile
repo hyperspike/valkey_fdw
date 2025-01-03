@@ -18,6 +18,8 @@
 MODULE_big = valkey_fdw
 OBJS = valkey_fdw.o
 
+PG_CFLAGS = -DDEBUG
+
 EXTENSION = valkey_fdw
 DATA = valkey_fdw--1.0.sql
 
@@ -45,3 +47,10 @@ endif
 
 # we put all the tests in a test subdir, but pgxs expects us not to, darn it
 override pg_regress_clean_files = test/results/ test/regression.diffs test/regression.out tmp_check/ log/
+
+up:
+	docker compose up
+	./mkcluster.sh
+	./init.sh
+down:
+	docker compose down

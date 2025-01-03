@@ -1,0 +1,43 @@
+services:
+  valkey-1:
+    image: valkey/valkey:8.0.1-alpine
+    command: --cluster-enabled yes --protected-mode no --cluster-config-file /data/nodes.conf --dir /data
+    networks:
+    - valkey
+    volumes:
+    - valkey-1-data:/data
+  valkey-2:
+    image: valkey/valkey:8.0.1-alpine
+    command: --cluster-enabled yes --protected-mode no --cluster-config-file /data/nodes.conf --dir /data
+    networks:
+    - valkey
+    volumes:
+    - valkey-2-data:/data
+  valkey-3:
+    image: valkey/valkey:8.0.1-alpine
+    command: --cluster-enabled yes --protected-mode no --cluster-config-file /data/nodes.conf --dir /data
+    networks:
+    - valkey
+    volumes:
+    - valkey-3-data:/data
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_PASSWORD: password
+    ports:
+    - "5432:5432"
+    volumes:
+    - db-data:/var/lib/postgresql/data
+    networks:
+    - valkey
+
+volumes:
+  db-data:
+  valkey-1-data:
+  valkey-2-data:
+  valkey-3-data:
+
+networks:
+  valkey:

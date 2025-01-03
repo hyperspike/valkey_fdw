@@ -87,6 +87,7 @@ static struct ValkeyFdwOption valid_options[] =
 
 	/* Connection options */
 	{"address", ForeignServerRelationId},
+	{"url", ForeignServerRelationId},
 	{"port", ForeignServerRelationId},
 	{"password", UserMappingRelationId},
 	{"database", ForeignTableRelationId},
@@ -241,6 +242,9 @@ static inline TupleTableSlot *valkeyIterateForeignScanMulti(ForeignScanState *no
 static inline TupleTableSlot *valkeyIterateForeignScanSingleton(ForeignScanState *node);
 static void valkeyReScanForeignScan(ForeignScanState *node);
 static void valkeyEndForeignScan(ForeignScanState *node);
+static valkeyReply * valkeyClusterCommandToNodes(valkeyClusterContext *cc, const char *cmd, ...);
+static valkeyReply * valkeyCopyReply(valkeyReply *reply);
+static valkeyReply * valkeyAppendReply(valkeyReply *first, valkeyReply *second);
 
 static valkey_protocol valkeyGetProtocol(char *address);
 static char *valkeyGetAddress(char *url);
@@ -748,12 +752,19 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 
 	valkeyContext        *context;
 	valkeyClusterContext *cc;
-	valkeyReply *reply;
+	valkeyReply          *reply;
+	valkeyClusterNode    *node;
+
+	valkeyClusterNodeIterator iter;
+
+	long long int dbsize    = 0;
+	bool          iscluster = false;
 	struct timeval timeout = {1, 500000};
 
 #ifdef DEBUG
 	elog(NOTICE, "valkeyGetForeignRelSize");
 #endif
+
 
 	/*
 	 * Fetch options. Get everything so we don't need to re-fetch it later in
@@ -780,11 +791,15 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 	/* Connect to the database */
 	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
 	{
-		cc = valkeyClusterConnectWithTimeout(table_options.address, timeout, VALKEYCLUSTER_FLAG_NULL);
-		if (cc->err)
+		iscluster = true;
+		cc = valkeyClusterContextInit();
+		//valkeyClusterContextSetTimeout(cc, timeout);
+		valkeyClusterSetOptionAddNodes(cc, table_options.address);
+		if (valkeyClusterConnect2(cc) == VALKEY_ERR)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-					 errmsg("failed to connect to Valkey Cluster: %s",
+					 errmsg("failed to connect to Valkey Cluster %s: %s",
+							table_options.address,
 							cc->errstr)
 					 ));
 	}
@@ -820,19 +835,19 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 	}
 
 	/* Select the appropriate database */
-	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
-		reply = valkeyClusterCommand(cc, "SELECT %d", table_options.database);
-	else
-		reply = valkeyCommand(context, "SELECT %d", table_options.database);
-
-	if (!reply)
+	if (!(table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER))
 	{
-		valkeyFree(context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to select database %d: %d",
-						table_options.database, context->err)
-				 ));
+		reply = valkeyCommand(context, "SELECT %d", table_options.database);
+		if (!reply)
+		{
+			valkeyFree(context);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to select database %d: %d",
+							table_options.database, context->err)
+					 ));
+		}
+		freeReplyObject(reply);
 	}
 
 	/* Execute a query to get the table size */
@@ -897,19 +912,42 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 	}
 	else
 	{
-		if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
-			reply = valkeyClusterCommand(cc, "DBSIZE");
-		else
+		if (!(table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER))
 			reply = valkeyCommand(context, "DBSIZE");
+		else
+		{
+
+			valkeyClusterInitNodeIterator(&iter, cc);
+			while ((node = valkeyClusterNodeNext(&iter)) != NULL)
+			{
+				reply = valkeyClusterCommandToNode(cc, node, "DBSIZE");
+				if (reply)
+				{
+					dbsize += reply->integer;
+					freeReplyObject(reply);
+				}
+				else
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+							 errmsg("failed to get the database size: %d, %s", cc->err, cc->err ? cc->errstr : "")
+							 ));
+					valkeyClusterFree(cc);
+				}
+			}
+		}
 	}
 
 	if (!reply)
 	{
-		valkeyFree(context);
-		ereport(ERROR,
+		if (!(table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER))
+		{
+			ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				 errmsg("failed to get the database size: %d", context->err)
 				 ));
+			valkeyFree(context);
+		}
 	}
 
 #if 0
@@ -920,13 +958,15 @@ valkeyGetForeignRelSize(PlannerInfo *root,
 	if (table_options.keyprefix)
 		baserel->rows = reply->integer / 20;
 	else
-		baserel->rows = reply->integer;
+		baserel->rows = iscluster ? dbsize : reply->integer;
 
-	freeReplyObject(reply);
 	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
 		valkeyClusterFree(cc);
 	else
+	{
+		freeReplyObject(reply);
 		valkeyFree(context);
+	}
 }
 
 /*
@@ -1020,6 +1060,9 @@ valkeyExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 
+	bool iscluster = false;
+	if (festate->cc)
+		iscluster = true;
 #ifdef DEBUG
 	elog(NOTICE, "valkeyExplainForeignScan");
 #endif
@@ -1035,20 +1078,27 @@ valkeyExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	if (festate->keyset)
 	{
-		reply = valkeyCommand(festate->context, "SCARD %s", festate->keyset);
+		if (iscluster)
+			reply = valkeyClusterCommand(festate->cc, "SCARD %s", festate->keyset);
+		else
+			reply = valkeyCommand(festate->context, "SCARD %s", festate->keyset);
 	}
 	else
 	{
-		reply = valkeyCommand(festate->context, "DBSIZE");
+		if (!iscluster)
+			reply = valkeyCommand(festate->context, "DBSIZE");
 	}
 
 	if (!reply)
 	{
-		valkeyFree(festate->context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-			errmsg("failed to get the table size: %d", festate->context->err)
-				 ));
+		if (!iscluster)
+		{
+			valkeyFree(festate->context);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				errmsg("failed to get the table size: %d", festate->context->err)
+					 ));
+		}
 	}
 
 	if (reply->type == VALKEY_REPLY_ERROR)
@@ -1061,12 +1111,22 @@ valkeyExplainForeignScan(ForeignScanState *node, ExplainState *es)
 				 ));
 	}
 
-	ExplainPropertyInteger("Foreign Valkey Table Size", "b",
+	if (iscluster) // this is complicated and we'll have to build an iterator
+	{
+		ExplainPropertyInteger("Foreign Valkey Table Size", "b",
+						festate->keyprefix ? reply->integer / 20 :
+						12,
+						es);
+	}
+	else
+	{
+		ExplainPropertyInteger("Foreign Valkey Table Size", "b",
 						festate->keyprefix ? reply->integer / 20 :
 						reply->integer,
 						es);
 
-	freeReplyObject(reply);
+		freeReplyObject(reply);
+	}
 }
 
 /*
@@ -1078,7 +1138,9 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	valkeyTableOptions table_options;
 	valkeyContext *context;
+	valkeyClusterContext *cc;
 	valkeyReply *reply;
+	bool iscluster = false;
 	char	   *qual_key = NULL;
 	char	   *qual_value = NULL;
 	bool		pushdown = false;
@@ -1102,62 +1164,91 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Fetch options  */
 	valkeyGetOptions(RelationGetRelid(node->ss.ss_currentRelation),
 					&table_options);
-
-	/* Connect to the server */
-	context = valkeyConnectWithTimeout(table_options.address,
-									  table_options.port, timeout);
-
-	if (context->err)
+	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
 	{
-		valkeyFree(context);
-		ereport(ERROR,
+		iscluster = true;
+		cc = valkeyClusterContextInit();
+		//valkeyClusterContextSetTimeout(cc, timeout);
+		valkeyClusterSetOptionAddNodes(cc, table_options.address);
+		if (valkeyClusterConnect2(cc) == VALKEY_ERR)
+		{
+			ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Valkey: %s", context->errstr)
+				 errmsg("Valkey Cluster not supported for scans %s", cc->errstr)
 				 ));
+			valkeyClusterFree(cc);
+		}
 	}
-
-	/* Authenticate */
-	if (table_options.password)
+	else
 	{
-		reply = valkeyCommand(context, "AUTH %s", table_options.password);
-
-		if (!reply)
+		/* Connect to the server */
+		context = valkeyConnectWithTimeout(table_options.address,
+										  table_options.port, timeout);
+		if (context->err)
 		{
 			valkeyFree(context);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-			   errmsg("failed to authenticate to valkey: %s", context->errstr)
+					 errmsg("failed to connect to Valkey: %s", context->errstr)
 					 ));
+		}
+	}
+	/* Authenticate */
+	if (table_options.password)
+	{
+		if (iscluster)
+			reply = valkeyClusterCommand(cc, "AUTH %s", table_options.password);
+		else
+			reply = valkeyCommand(context, "AUTH %s", table_options.password);
+
+		if (!reply)
+		{
+			if (iscluster)
+			{
+				valkeyClusterFree(cc);
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					errmsg("failed to authenticate to valkey: %s", cc->errstr)
+					 ));
+			}
+			else
+			{
+				valkeyFree(context);
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					errmsg("failed to authenticate to valkey: %s", context->errstr)
+					 ));
+			}
 		}
 
 		freeReplyObject(reply);
 	}
 
-	/* Select the appropriate database */
-	reply = valkeyCommand(context, "SELECT %d", table_options.database);
-
-	if (!reply)
+	/* Select the appropriate database does not apply in cluster mode*/
+	if (!iscluster)
 	{
-		valkeyFree(context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to select database %d: %s",
-						table_options.database, context->errstr)
-				 ));
+		reply = valkeyCommand(context, "SELECT %d", table_options.database);
+		if (!reply)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to select database %d: %s",
+							table_options.database, context->errstr)
+					 ));
+			valkeyFree(context);
+		}
+		if (reply->type == VALKEY_REPLY_ERROR)
+		{
+			char	   *err = pstrdup(reply->str);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to select database %d: %s",
+							table_options.database, err)
+					 ));
+		}
+		freeReplyObject(reply);
 	}
-
-	if (reply->type == VALKEY_REPLY_ERROR)
-	{
-		char	   *err = pstrdup(reply->str);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to select database %d: %s",
-						table_options.database, err)
-				 ));
-	}
-
-	freeReplyObject(reply);
 
 	/* See if we've got a qual we can push down */
 	if (node->ss.ps.plan->qual)
@@ -1181,6 +1272,7 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 	festate = (ValkeyFdwExecutionState *) palloc(sizeof(ValkeyFdwExecutionState));
 	node->fdw_state = (void *) festate;
 	festate->context = context;
+	festate->cc = cc;
 	festate->reply = NULL;
 	festate->row = 0;
 	festate->address = table_options.address;
@@ -1218,23 +1310,41 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 		switch (table_options.table_type)
 		{
 			case PG_VALKEY_SCALAR_TABLE:
-				reply = valkeyCommand(context, "GET %s", festate->singleton_key);
+				if (iscluster)
+					reply = valkeyClusterCommand(cc, "GET %s", festate->singleton_key);
+				else
+					reply = valkeyCommand(context, "GET %s", festate->singleton_key);
 				break;
 			case PG_VALKEY_HASH_TABLE:
 				/* the singleton case where a qual pushdown makes most sense */
 				if (qual_value && pushdown)
-					reply = valkeyCommand(context, "HGET %s %s", festate->singleton_key, qual_value);
+					if (iscluster)
+						reply = valkeyClusterCommand(cc, "HGET %s %s", festate->singleton_key, qual_value);
+					else
+						reply = valkeyCommand(context, "HGET %s %s", festate->singleton_key, qual_value);
 				else
-					reply = valkeyCommand(context, "HGETALL %s", festate->singleton_key);
+					if (iscluster)
+						reply = valkeyClusterCommand(cc, "HGETALL %s", festate->singleton_key);
+					else
+						reply = valkeyCommand(context, "HGETALL %s", festate->singleton_key);
 				break;
 			case PG_VALKEY_LIST_TABLE:
-				reply = valkeyCommand(context, "LRANGE %s 0 -1", table_options.singleton_key);
+				if (iscluster)
+					reply = valkeyClusterCommand(cc, "LRANGE %s 0 -1", table_options.singleton_key);
+				else
+					reply = valkeyCommand(context, "LRANGE %s 0 -1", table_options.singleton_key);
 				break;
 			case PG_VALKEY_SET_TABLE:
-				reply = valkeyCommand(context, "SMEMBERS %s", table_options.singleton_key);
+				if (iscluster)
+					reply = valkeyClusterCommand(cc, "SMEMBERS %s", table_options.singleton_key);
+				else
+					reply = valkeyCommand(context, "SMEMBERS %s", table_options.singleton_key);
 				break;
 			case PG_VALKEY_ZSET_TABLE:
-				reply = valkeyCommand(context, "ZRANGEBYSCORE %s -inf inf WITHSCORES", table_options.singleton_key);
+				if (iscluster)
+					reply = valkeyClusterCommand(cc, "ZRANGEBYSCORE %s -inf inf WITHSCORES", table_options.singleton_key);
+				else
+					reply = valkeyCommand(context, "ZRANGEBYSCORE %s -inf inf WITHSCORES", table_options.singleton_key);
 				break;
 			default:
 				;
@@ -1252,15 +1362,30 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 		{
 			valkeyReply *sreply;
 
-			sreply = valkeyCommand(context, "SISMEMBER %s %s",
+			if (iscluster)
+				sreply = valkeyClusterCommand(cc, "SISMEMBER %s %s",
+								  festate->keyset, qual_value);
+			else
+				sreply = valkeyCommand(context, "SISMEMBER %s %s",
 								  festate->keyset, qual_value);
 			if (!sreply)
 			{
-				valkeyFree(festate->context);
-				ereport(ERROR,
+				if (iscluster)
+				{
+					ereport(ERROR,
 						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-						 errmsg("failed to list keys: %s", context->errstr)
+						 errmsg("SISMEMBER failed to list keys: %s", cc->errstr)
 						 ));
+					valkeyClusterFree(cc);
+				}
+				else
+				{
+					ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+						 errmsg("SISMEMBER failed to list keys: %s", context->errstr)
+						 ));
+					valkeyFree(festate->context);
+				}
 			}
 			if (sreply->type == VALKEY_REPLY_ERROR)
 			{
@@ -1269,7 +1394,7 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 				freeReplyObject(sreply);
 				ereport(ERROR,
 						(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-						 errmsg("failed to list keys: %s", err)
+						 errmsg("SISMEMBER failed to list keys: %s", err)
 						 ));
 
 			}
@@ -1291,7 +1416,10 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 		 * checks, is any, so we know the item is really there.
 		 */
 
-		reply = valkeyCommand(context, "EXISTS %s", qual_value);
+		if (iscluster)
+			reply = valkeyClusterCommand(cc, "EXISTS %s", qual_value);
+		else
+			reply = valkeyCommand(context, "EXISTS %s", qual_value);
 		if (reply->integer == 0)
 			festate->row = -1;
 
@@ -1302,29 +1430,52 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 		if (festate->keyset)
 		{
 			festate->cursor_search_string = "SSCAN %s %s" COUNT;
-			reply = valkeyCommand(context, festate->cursor_search_string,
-								 festate->keyset, ZERO);
+			if (iscluster)
+				reply = valkeyClusterCommand(cc, festate->cursor_search_string, festate->keyset, ZERO);
+			else
+				reply = valkeyCommand(context, festate->cursor_search_string,  festate->keyset, ZERO);
 		}
 		else if (festate->keyprefix)
 		{
 			festate->cursor_search_string = "SCAN %s MATCH %s*" COUNT;
-			reply = valkeyCommand(context, festate->cursor_search_string,
+			if (iscluster)
+				reply = valkeyClusterCommand(cc, festate->cursor_search_string,
+								 ZERO, festate->keyprefix);
+			else
+				reply = valkeyCommand(context, festate->cursor_search_string,
 								 ZERO, festate->keyprefix);
 		}
 		else
 		{
 			festate->cursor_search_string = "SCAN %s" COUNT;
-			reply = valkeyCommand(context, festate->cursor_search_string, ZERO);
+			if (iscluster) {
+#ifdef DEBUG
+				elog(NOTICE, "BeginForeignScan assign festate->reply, cursor_search_string");
+#endif
+				reply = valkeyClusterCommandToNodes(cc, festate->cursor_search_string, ZERO);
+			} else
+				reply = valkeyCommand(context, festate->cursor_search_string, ZERO);
 		}
 	}
 
 	if (!reply)
 	{
-		valkeyFree(festate->context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to list keys: %s", context->errstr)
-				 ));
+		if (iscluster)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to list keys: %s/%s", festate->cursor_search_string, cc->errstr)
+					 ));
+			valkeyClusterFree(cc);
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to list keys: %s/%s", festate->cursor_search_string, context->errstr)
+					 ));
+			valkeyFree(festate->context);
+		}
 	}
 	else if (reply->type == VALKEY_REPLY_ERROR)
 	{
@@ -1343,12 +1494,14 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 
 	if (festate->singleton_key)
 	{
+#ifdef DEBUG
+		elog(NOTICE, "BeginForeignScan assign festate->reply, singleton_key");
+#endif
 		festate->reply = reply;
 	}
 	else if (festate->row > -1 && festate->qual_value == NULL)
 	{
 		valkeyReply *cursor = reply->element[0];
-
 		if (cursor->type == VALKEY_REPLY_STRING)
 		{
 			if (cursor->len == 1 && cursor->str[0] == '0')
@@ -1363,10 +1516,182 @@ valkeyBeginForeignScan(ForeignScanState *node, int eflags)
 					 errmsg("wrong reply type %d", cursor->type)
 					 ));
 		}
-
 		/* for cursors, this is the list of elements */
 		festate->reply = reply->element[1];
 	}
+}
+
+static valkeyReply * valkeyClusterCommandToNodes(valkeyClusterContext *cc, const char *format, ...)
+{
+	valkeyReply               *reply;
+	valkeyClusterNodeIterator  iter;
+	valkeyClusterNode         *node;
+	valkeyReply               *clusterReply = NULL;
+
+	va_list  ap;
+	char    *cmd;
+	int      i;
+	int      err = 0;
+
+	va_start(ap, format);
+	err = vasprintf(&cmd, format, ap);
+	if (err < 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("failed to format command: %d", err)
+				 ));
+	}
+	va_end(ap);
+#ifdef DEBUG
+	elog(NOTICE, "valkeyClusterCommandToNodes %s", cmd);
+#endif
+	valkeyClusterInitNodeIterator(&iter, cc);
+	while ((node = valkeyClusterNodeNext(&iter)) != NULL)
+	{
+#ifdef DEBUG
+		elog(NOTICE, "valkeyClusterCommandToNode %d, %s %s", i++, node->name, cmd);
+#endif
+		reply = valkeyClusterCommandToNode(cc, node, cmd);
+		if (reply && reply->type != VALKEY_REPLY_ERROR)
+		{
+			clusterReply = valkeyAppendReply(clusterReply, reply);
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to get the database size: %d, %s", cc->err, cc->err ? cc->errstr : "")
+					 ));
+			//valkeyClusterFree(cc);
+		}
+#ifdef DEBUG
+		elog(NOTICE, "valkeyClusterCommandToNode %d, %s %s done, freeing", i, node->name, cmd);
+#endif
+		freeReplyObject(reply);
+	}
+	//pfree(cmd);
+	return clusterReply;
+}
+
+static valkeyReply * valkeyCopyReply(valkeyReply *src) {
+	valkeyReply *dst = NULL;
+#ifdef DEBUG
+	elog(NOTICE, "valkeyCopyReply");
+#endif
+	if (src == NULL) {
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("failed to copy reply: src is NULL")
+				 ));
+		return NULL;
+	}
+	if (dst == NULL) {
+		dst = palloc(sizeof(valkeyReply));
+		memset(dst, 0, sizeof(valkeyReply));
+		Assert(dst != NULL);
+	}
+	dst->type = src->type;
+	dst->elements = src->elements;
+	switch (dst->type) {
+	case VALKEY_REPLY_STRING:
+		dst->str = palloc(src->len);
+		memset(dst->str, 0, src->len);
+		Assert(dst->str != NULL);
+		dst->len = src->len;
+		memcpy(dst->str, src->str, src->len);
+		break;
+	case VALKEY_REPLY_INTEGER:
+		dst->integer = src->integer;
+		break;
+	case VALKEY_REPLY_ARRAY:
+		dst->element = palloc(sizeof(valkeyReply *) * dst->elements);
+		memset(dst->element, 0, sizeof(valkeyReply *) * dst->elements);
+		Assert(dst->element != NULL);
+		// printf("src->elements: %ld\n", dst->elements);
+		for (int i = 0; i < dst->elements; i++) {
+			dst->element[i] = NULL;
+			dst->element[i] = valkeyCopyReply(src->element[i]);
+		}
+		break;
+	default:
+		break;
+	}
+#ifdef DEBUG
+	elog(NOTICE, "valkeyCopyReply done");
+#endif
+	return dst;
+}
+
+static valkeyReply *
+valkeyAppendReply(valkeyReply *first, valkeyReply *second)
+{
+	valkeyReply *dst;
+#ifdef DEBUG
+	elog(NOTICE, "valkeyAppendReply");
+#endif
+	if (second == NULL) {
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("failed to append reply: second is NULL")
+				 ));
+		return NULL;
+	}
+	if (first == NULL) {
+		return valkeyCopyReply(second);
+	}
+	if (first->type != VALKEY_REPLY_ARRAY || second->type != VALKEY_REPLY_ARRAY) {
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("failed to append reply: %d, %d", first->type, second->type)
+				 ));
+		return NULL;
+	}
+#ifdef DEBUG
+	elog(NOTICE, "valkeyAppendReply building dst");
+#endif
+	dst = palloc(sizeof(valkeyReply));
+	memset(dst, 0, sizeof(valkeyReply));
+	Assert(dst != NULL);
+	dst->type = VALKEY_REPLY_ARRAY;
+	dst->elements = 2;
+	dst->element = palloc(sizeof(valkeyReply *) * dst->elements);
+	memset(dst->element, 0, sizeof(valkeyReply *) * dst->elements);
+	Assert(dst->element != NULL);
+	dst->element[0] = NULL;
+	dst->element[0] = valkeyCopyReply(first->element[0]);
+
+#ifdef DEBUG
+	elog(NOTICE, "valkeyAppendReply building dst->element[1]");
+#endif
+	dst->element[1] = NULL;
+	dst->element[1] = valkeyCopyReply(first->element[1]);
+	dst->element[1]->elements += second->element[1]->elements;
+	dst->element[1]->element = palloc(sizeof(valkeyReply *) * dst->element[1]->elements);
+	memset(dst->element[1]->element, 0, sizeof(valkeyReply *) * dst->element[1]->elements);
+	Assert(dst->element[1]->element != NULL);
+#ifdef DEBUG
+	elog(NOTICE, "valkeyAppendReply copying first elements");
+#endif
+	for (int i = 0; i < first->element[1]->elements; i++) {
+		dst->element[1]->element[i] = NULL;
+		dst->element[1]->element[i] = valkeyCopyReply(first->element[1]->element[i]);
+	}
+#ifdef DEBUG
+	elog(NOTICE, "valkeyAppendReply copying second elements");
+#endif
+	for (int i = 0; i < second->element[1]->elements; i++) {
+		dst->element[1]->element[first->element[1]->elements + i] = NULL;
+		dst->element[1]->element[first->element[1]->elements + i] = valkeyCopyReply(second->element[1]->element[i]);
+	}
+#ifdef DEBUG
+	elog(NOTICE, "valkeyAppendReply done");
+#endif
+/*
+	freeReplyObject(first);
+	elog(NOTICE, "valkeyAppendReply done free first");
+*/
+	return dst;
 }
 
 /*
@@ -1382,7 +1707,9 @@ static TupleTableSlot *
 valkeyIterateForeignScan(ForeignScanState *node)
 {
 	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
-
+#ifdef DEBUG
+	elog(NOTICE, "valkeyIterateForeignScan");
+#endif
 	if (festate->singleton_key)
 		return valkeyIterateForeignScanSingleton(node);
 	else
@@ -1398,9 +1725,12 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 	char	   *data = 0;
 	char	  **values;
 	HeapTuple	tuple;
+	bool        iscluster = false;
 
 	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	if (festate->cc != NULL)
+		iscluster = true;
 
 #ifdef DEBUG
 	elog(NOTICE, "valkeyIterateForeignScanMulti");
@@ -1419,6 +1749,9 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 	while (festate->cursor_id != NULL &&
 		   festate->row >= festate->reply->elements)
 	{
+#ifdef DEBUG
+		elog(NOTICE, "valkeyIterateForeignScanMulti fetch next set");
+#endif
 		valkeyReply *creply;
 		valkeyReply *cursor;
 
@@ -1426,31 +1759,68 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 
 		if (festate->keyset)
 		{
-			creply = valkeyCommand(festate->context,
+#ifdef DEBUG
+			elog(NOTICE, "valkeyIterateForeignScanMulti get next set '%s'", festate->cursor_search_string);
+#endif
+
+			if (iscluster)
+				creply = valkeyClusterCommand(festate->cc,
+								  festate->cursor_search_string,
+								  festate->keyset, festate->cursor_id);
+			else
+				creply = valkeyCommand(festate->context,
 								  festate->cursor_search_string,
 								  festate->keyset, festate->cursor_id);
 		}
 		else if (festate->keyprefix)
 		{
-			creply = valkeyCommand(festate->context,
+#ifdef DEBUG
+			elog(NOTICE, "valkeyIterateForeignScanMulti get next set '%s'", festate->cursor_search_string);
+#endif
+			if (iscluster)
+				creply = valkeyClusterCommand(festate->cc,
 								  festate->cursor_search_string,
-								  festate->cursor_id, festate->keyprefix);
+								  festate->keyprefix, festate->cursor_id);
+			else
+				creply = valkeyCommand(festate->context,
+								  festate->cursor_search_string,
+								  festate->keyprefix, festate->cursor_id);
 		}
 		else
 		{
-			creply = valkeyCommand(festate->context,
+#ifdef DEBUG
+			elog(NOTICE, "valkeyIterateForeignScanMulti get next set '%s'", festate->cursor_search_string);
+#endif
+			if (iscluster)
+				creply = valkeyClusterCommand(festate->cc,
+								  festate->cursor_search_string,
+								  festate->cursor_id);
+			else
+				creply = valkeyCommand(festate->context,
 								  festate->cursor_search_string,
 								  festate->cursor_id);
 		}
 
 		if (!creply)
 		{
-			valkeyFree(festate->context);
-			ereport(ERROR,
+			if (iscluster)
+			{
+				ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to list keys: %s",
+							festate->cc->errstr)
+					 ));
+				valkeyClusterFree(festate->cc);
+			}
+			else
+			{
+				ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					 errmsg("failed to list keys: %s",
 							festate->context->errstr)
 					 ));
+				valkeyFree(festate->context);
+			}
 		}
 		else if (creply->type == VALKEY_REPLY_ERROR)
 		{
@@ -1489,6 +1859,9 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 		festate->row = 0;
 	}
 
+#ifdef DEBUG
+	elog(NOTICE, "valkeyIterateForeignScanMulti get next row");
+#endif
 	/*
 	 * -1 means we failed the qual test, so there are no rows or we've already
 	 * processed the qual
@@ -1502,6 +1875,9 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 		 * Get the row, check the result type, and handle accordingly. If it's
 		 * nil, we go ahead and get the next row.
 		 */
+#ifdef DEBUG
+		elog(NOTICE, "valkeyIterateForeignScanMulti get next row loop");
+#endif
 		do
 		{
 
@@ -1511,35 +1887,66 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 			switch (festate->table_type)
 			{
 				case PG_VALKEY_HASH_TABLE:
-					reply = valkeyCommand(festate->context,
+					if (iscluster)
+						reply = valkeyClusterCommand(festate->cc,
+										 "HGETALL %s", key);
+					else
+						reply = valkeyCommand(festate->context,
 										 "HGETALL %s", key);
 					break;
 				case PG_VALKEY_LIST_TABLE:
-					reply = valkeyCommand(festate->context,
+					if (iscluster)
+						reply = valkeyClusterCommand(festate->cc,
+										 "LRANGE %s 0 -1", key);
+					else
+						reply = valkeyCommand(festate->context,
 										 "LRANGE %s 0 -1", key);
 					break;
 				case PG_VALKEY_SET_TABLE:
-					reply = valkeyCommand(festate->context,
+					if (iscluster)
+						reply = valkeyClusterCommand(festate->cc,
+										 "SMEMBERS %s", key);
+					else
+						reply = valkeyCommand(festate->context,
 										 "SMEMBERS %s", key);
 					break;
 				case PG_VALKEY_ZSET_TABLE:
-					reply = valkeyCommand(festate->context,
+					if (iscluster)
+						reply = valkeyClusterCommand(festate->cc,
+										 "ZRANGE %s 0 -1", key);
+					else
+						reply = valkeyCommand(festate->context,
 										 "ZRANGE %s 0 -1", key);
 					break;
 				case PG_VALKEY_SCALAR_TABLE:
 				default:
-					reply = valkeyCommand(festate->context,
+					if (iscluster)
+						reply = valkeyClusterCommand(festate->cc,
+										 "GET %s", key);
+					else
+						reply = valkeyCommand(festate->context,
 										 "GET %s", key);
 			}
 
 			if (!reply)
 			{
-				freeReplyObject(festate->reply);
-				valkeyFree(festate->context);
-				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+				if (iscluster)
+				{
+					valkeyClusterFree(festate->cc);
+					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+						 errmsg("failed to get the value for key \"%s\": %s",
+								key, festate->cc->errstr)
+								));
+				}
+				else
+				{
+					valkeyFree(festate->context);
+					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 						 errmsg("failed to get the value for key \"%s\": %s",
 								key, festate->context->errstr)
 								));
+				}
+				freeReplyObject(festate->reply);
 			}
 
 			festate->row++;
@@ -1550,6 +1957,9 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 				 festate->qual_value == NULL &&
 				 festate->row < festate->reply->elements);
 
+#ifdef DEBUG
+		elog(NOTICE, "valkeyIterateForeignScanMulti get next row done");
+#endif
 		if (festate->qual_value != NULL || festate->row <= festate->reply->elements)
 		{
 			/*
@@ -1582,6 +1992,10 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 			festate->row = -1;
 	}
 
+#ifdef DEBUG
+	elog(NOTICE, "valkeyIterateForeignScanMulti build tuple");
+#endif
+
 	/* Build the tuple */
 	if (found)
 	{
@@ -1591,7 +2005,9 @@ valkeyIterateForeignScanMulti(ForeignScanState *node)
 		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
 		ExecStoreHeapTuple(tuple, slot, false);
 	}
-
+#ifdef DEBUG
+	elog(NOTICE, "valkeyIterateForeignScan cleanup");
+#endif
 	/* Cleanup */
 	if (reply)
 		freeReplyObject(reply);
@@ -1607,9 +2023,13 @@ valkeyIterateForeignScanSingleton(ForeignScanState *node)
 	char	   *data = NULL;
 	char	  **values;
 	HeapTuple	tuple;
+	bool        iscluster = false;
 
 	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	if (festate->cc != NULL)
+		iscluster = true;
 
 #ifdef DEBUG
 	elog(NOTICE, "valkeyIterateForeignScanSingleton");
@@ -1642,10 +2062,20 @@ valkeyIterateForeignScanSingleton(ForeignScanState *node)
 
 			case VALKEY_REPLY_ARRAY:
 				freeReplyObject(festate->reply);
-				valkeyFree(festate->context);
-				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-				errmsg("not expecting an array for a singleton scalar table")
-								));
+				if (iscluster)
+				{
+					valkeyClusterFree(festate->cc);
+					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+						 errmsg("not expecting an array for a singleton scalar table")
+						 ));
+				}
+				else
+				{
+					valkeyFree(festate->context);
+					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+						 errmsg("not expecting an array for a singleton scalar table")
+						 ));
+				}
 				break;
 		}
 	}
@@ -1668,10 +2098,20 @@ valkeyIterateForeignScanSingleton(ForeignScanState *node)
 
 			case VALKEY_REPLY_ARRAY:
 				freeReplyObject(festate->reply);
-				valkeyFree(festate->context);
-				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-								errmsg("not expecting an array for a single hash property: %s", festate->qual_value)
-								));
+				if (iscluster)
+				{
+					valkeyClusterFree(festate->cc);
+					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+						 errmsg("not expecting an array for a single hash property: %s", festate->qual_value)
+						 ));
+				}
+				else
+				{
+					valkeyFree(festate->context);
+					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+						 errmsg("not expecting an array for a single hash property: %s", festate->qual_value)
+						 ));
+				}
 				break;
 		}
 	}
@@ -1699,10 +2139,20 @@ valkeyIterateForeignScanSingleton(ForeignScanState *node)
 
 				case VALKEY_REPLY_ARRAY:
 					freeReplyObject(festate->reply);
-					valkeyFree(festate->context);
-					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+					if (iscluster)
+					{
+						valkeyClusterFree(festate->cc);
+						ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+							 errmsg("not expecting array for a hash value or zset score")
+							 ));
+					}
+					else
+					{
+						valkeyFree(festate->context);
+						ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 									errmsg("not expecting array for a hash value or zset score")
 									));
+					}
 					break;
 			}
 			festate->row++;
@@ -1731,20 +2181,36 @@ static void
 valkeyEndForeignScan(ForeignScanState *node)
 {
 	ValkeyFdwExecutionState *festate = (ValkeyFdwExecutionState *) node->fdw_state;
-
 #ifdef DEBUG
-	elog(NOTICE, "valkeyEndForeignScan");
+	elog(NOTICE, "valkeyEndForeignScan start");
 #endif
 
 	/* if festate is NULL, we are in EXPLAIN; nothing to do */
 	if (festate)
 	{
-		if (festate->reply)
-			freeReplyObject(festate->reply);
+#ifdef DEBUG
+		elog(NOTICE, "valkeyEndForeignScan freereply");
+#endif
+		//if (festate->reply)
+		//	freeReplyObject(festate->reply);
 
-		if (festate->context)
-			valkeyFree(festate->context);
+#ifdef DEBUG
+		elog(NOTICE, "valkeyEndForeignScan freeclustercontext");
+#endif
+		if (festate->cc)
+			valkeyClusterFree(festate->cc);
+		else
+		{
+#ifdef DEBUG
+			elog(NOTICE, "valkeyEndForeignScan freecontext");
+#endif
+			if (festate->context)
+				valkeyFree(festate->context);
+		}
 	}
+#ifdef DEBUG
+	elog(NOTICE, "valkeyEndForeignScan done");
+#endif
 }
 
 /*
@@ -2004,7 +2470,10 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 	valkeyClusterContext *cc;
 	valkeyReply          *reply;
 	ValkeyFdwModifyState *fmstate;
+	valkeyClusterNodeIterator iter;
+	valkeyClusterNode *node;
 
+	char *err;
 	struct timeval timeout = {1, 500000};
 	Relation	rel = rinfo->ri_RelationDesc;
 	ListCell   *lc;
@@ -2029,8 +2498,7 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 
 
 	/* Fetch options  */
-	valkeyGetOptions(RelationGetRelid(rel),
-					&table_options);
+	valkeyGetOptions(RelationGetRelid(rel), &table_options);
 
 
 	fmstate = (ValkeyFdwModifyState *) palloc(sizeof(ValkeyFdwModifyState));
@@ -2052,7 +2520,8 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 	fmstate->array_elem_type = list_nth_oid(array_elem_list, 0);
 
 	fmstate->p_nums = 0;
-
+	err = palloc(256);
+	memset(err, 0, 256);
 	if (op == CMD_UPDATE || op == CMD_DELETE)
 	{
 		Plan	   *subplan = outerPlanState(mtstate)->plan;
@@ -2165,15 +2634,44 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 	/* Finally, Connect to the server and set the Valkey execution context */
 	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
 	{
-		cc = valkeyClusterConnectWithTimeout(table_options.address, timeout, VALKEYCLUSTER_FLAG_NULL);
-
-		if (cc->err)
+		cc = valkeyClusterContextInit();
+		//valkeyClusterContextSetTimeout(cc, timeout);
+		valkeyClusterSetOptionAddNodes(cc, table_options.address);
+		if (valkeyClusterConnect2(cc) == VALKEY_ERR)
 		{
-			valkeyClusterFree(cc);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-					 errmsg("failed to connect to Valkey cluster: %s", cc->errstr)
+					 errmsg("failed to connect to Valkey cluster [%s]: %s", table_options.address, cc->errstr)
 					 ));
+			valkeyClusterFree(cc);
+		}
+		if (cc == NULL || cc->err)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to connect to Valkey cluster [%s]: %s", table_options.address, cc->errstr)
+					 ));
+			valkeyClusterFree(cc);
+		}
+		valkeyClusterInitNodeIterator(&iter, cc);
+		node = valkeyClusterNodeNext(&iter);
+		while (node != NULL) {
+			reply = valkeyClusterCommandToNode(cc, node, "PING");
+			if (reply == NULL || reply->type == VALKEY_REPLY_ERROR)
+			{
+				if (sprintf(err, "failed to ping cluster [%s/%s]", table_options.address, node->host) < 0)
+				{
+					check_cluster_reply(reply, cc, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+									err, NULL);
+				}
+				else
+				{
+					check_cluster_reply(reply, cc, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+									"failed to ping cluster", NULL);
+				}
+			}
+			freeReplyObject(reply);
+			node = valkeyClusterNodeNext(&iter);
 		}
 	}
 	else
@@ -2183,12 +2681,15 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 
 		if (context->err)
 		{
-			valkeyFree(context);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
 					 errmsg("failed to connect to Valkey: %s", context->errstr)
 					 ));
+			valkeyFree(context);
 		}
+		reply = valkeyCommand(context, "PING");
+		check_reply(reply, context, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+					"failed to ping", NULL);
 	}
 
 	/* Authenticate */
@@ -2201,11 +2702,22 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 
 		if (!reply)
 		{
-			valkeyFree(context);
-			ereport(ERROR,
+			if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
+			{
+				valkeyClusterFree(cc);
+				ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-			   errmsg("failed to authenticate to valkey: %s", context->errstr)
-					 ));
+						errmsg("failed to authenticate to valkey: %s", cc->errstr)
+					));
+			}
+			else
+			{
+				valkeyFree(context);
+				ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+						errmsg("failed to authenticate to valkey: %s", context->errstr)
+					));
+			}
 		}
 
 		freeReplyObject(reply);
@@ -2214,9 +2726,11 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 	/* Select the appropriate database */
 	if (table_options.protocol == VALKEY_CLUSTER || table_options.protocol == VALKEY_TLS_CLUSTER)
 	{
-		reply = valkeyClusterCommand(cc, "SELECT %d", table_options.database);
-		check_cluster_reply(reply, cc, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
-							"failed to select database", NULL);
+		/* Cluster Mode does not support multiple databases, so we don't need to select
+		 * reply = valkeyClusterCommand(cc, "SELECT %d", table_options.database);
+		 * check_cluster_reply(reply, cc, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+		 *					"failed to select database", NULL);
+		 */
 		fmstate->cc = cc;
 	}
 	else
@@ -2225,8 +2739,8 @@ valkeyBeginForeignModify(ModifyTableState *mtstate,
 		check_reply(reply, context, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
 					"failed to select database", NULL);
 		fmstate->context = context;
+		freeReplyObject(reply);
 	}
-	freeReplyObject(reply);
 }
 
 static void
@@ -3560,13 +4074,30 @@ valkeyEndForeignModify(EState *estate,
 	ValkeyFdwModifyState *fmstate = (ValkeyFdwModifyState *) rinfo->ri_FdwState;
 
 #ifdef DEBUG
-	elog(NOTICE, "valkeyEndForeignScan");
+	elog(NOTICE, "valkeyEndForeignModify");
 #endif
 
 	/* if fmstate is NULL, we are in EXPLAIN; nothing to do */
 	if (fmstate)
 	{
-		if (fmstate->context)
-			valkeyFree(fmstate->context);
+
+#ifdef DEBUG
+		elog(NOTICE, "valkeyEndForeignModify clusterfree");
+#endif
+		if (fmstate->cc) {
+			valkeyClusterFree(fmstate->cc);
+		}
+		else
+		{
+#ifdef DEBUG
+			elog(NOTICE, "valkeyEndForeignModify contextfree");
+#endif
+			if (fmstate->context)
+				valkeyFree(fmstate->context);
+		}
 	}
+
+#ifdef DEBUG
+	elog(NOTICE, "valkeyEndForeignModify done");
+#endif
 }
